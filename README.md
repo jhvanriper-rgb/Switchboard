@@ -4,6 +4,8 @@ A small local web app for switching between local model backends (Ollama, llama.
 
 Standard library only (Python 3). No packages to install.
 
+![Switchboard showing backends, GPU gauges, history chart and chat](docs/screenshot.png)
+
 ## Run
 
     python3 switchboard.py
