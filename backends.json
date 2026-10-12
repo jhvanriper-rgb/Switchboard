@@ -1,0 +1,131 @@
+{
+  "_note": "Entries whose command contains TODO show as 'not set up' and cannot be started. Group 'gpu' means only one such entry runs at a time (starting one stops the others). Any other group runs alongside anything and is left alone by 'Stop all models'. Commands are split like a shell would (no pipes or &&); set \"shell\": true on an entry if you need those.",
+  "port": 8090,
+  "backends": [
+    {
+      "id": "ollama",
+      "name": "Ollama",
+      "subtitle": "gemma4:31b-192k and friends",
+      "group": "gpu",
+      "kind": "systemd",
+      "unit": "ollama",
+      "use_pkexec": true,
+      "port": 11434,
+      "health": "http://127.0.0.1:11434/api/tags",
+      "openai_base": "http://127.0.0.1:11434/v1",
+      "chat_model": "gemma4:31b-192k"
+    },
+    {
+      "id": "dsh",
+      "name": "DeepSeek Harness",
+      "subtitle": "systemd service dsh",
+      "group": "gpu",
+      "kind": "systemd",
+      "unit": "dsh",
+      "use_pkexec": true,
+      "port": 3080,
+      "health": "http://127.0.0.1:3080/"
+    },
+    {
+      "id": "llamacpp-qwen",
+      "name": "llama.cpp: Qwen3.8 Flash Next",
+      "subtitle": "4.27 bpw, 131K context, CUDA1",
+      "group": "gpu",
+      "kind": "process",
+      "command": "/home/james/llama.cpp/build/bin/llama-server -m /home/james/models/atomic-chat/Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64/Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64-00001-of-00033.gguf --jinja -c 131072 -np 1 -fa on --device CUDA1 --port 8888",
+      "cwd": "/home/james/llama.cpp",
+      "port": 8888,
+      "health": "http://127.0.0.1:8888/health",
+      "openai_base": "http://127.0.0.1:8888/v1",
+      "chat_model": "default",
+      "slow_start": true
+    },
+    {
+      "id": "strata-flash-next",
+      "name": "Strata: Qwen3.8 Flash Next",
+      "subtitle": "MoE offload engine",
+      "group": "gpu",
+      "kind": "process",
+      "command": "/home/james/Strata-main/.venv/bin/python /home/james/Strata-main/serve/server.py --engine strata --config /home/james/Strata-main/strata-swift-iq2_xs.json --port 9999",
+      "cwd": "/home/james/Strata-main",
+      "port": 9999,
+      "health": "http://127.0.0.1:9999/v1/models",
+      "openai_base": "http://127.0.0.1:9999/v1",
+      "chat_model": "default",
+      "slow_start": true,
+      "env": {
+        "STRATA_EXPERIMENTAL_SM60": "1"
+      }
+    },
+    {
+      "id": "maya",
+      "name": "Maya: GLM-5.3-Flash",
+      "subtitle": "Maya-S, 321B MoE",
+      "group": "gpu",
+      "kind": "process",
+      "command": "/home/james/project-maya/run-maya-maya-s-v2-iq2_xxs.sh --port 8083",
+      "cwd": "/home/james/project-maya",
+      "port": 8083,
+      "health": "http://127.0.0.1:8083/v1/models",
+      "openai_base": "http://127.0.0.1:8083/v1",
+      "chat_model": "default",
+      "slow_start": true
+    },
+    {
+      "id": "comfyui",
+      "name": "ComfyUI",
+      "subtitle": "image generation, GPU 1",
+      "group": "gpu",
+      "kind": "process",
+      "command": "/home/james/ComfyUI/venv/bin/python /home/james/ComfyUI/main.py --cuda-device 1",
+      "cwd": "/home/james/ComfyUI",
+      "port": 8188,
+      "health": "http://127.0.0.1:8188/system_stats",
+      "open_url": "http://127.0.0.1:8188"
+    },
+    {
+      "id": "litellm",
+      "name": "LiteLLM",
+      "subtitle": "proxy in front of the models",
+      "group": "support",
+      "kind": "process",
+      "command": "litellm --config /home/james/litellm/config.yaml --port 4000",
+      "cwd": "/home/james/litellm",
+      "port": 4000,
+      "health": "http://127.0.0.1:4000/"
+    },
+    {
+      "id": "whisper",
+      "name": "Whisper",
+      "subtitle": "speech to text",
+      "group": "support",
+      "kind": "process",
+      "command": "/home/james/audio.cpp/build/bin/whisper-server --port 9000 -m /home/james/audio.cpp/ggml-small.bin",
+      "cwd": "/home/james/audio.cpp",
+      "port": 9000,
+      "health": "http://127.0.0.1:9000/"
+    },
+    {
+      "id": "tts",
+      "name": "TTS",
+      "subtitle": "Coqui, text to speech",
+      "group": "support",
+      "kind": "process",
+      "command": "/home/james/tts_env/bin/python -m TTS.server.server",
+      "cwd": "/home/james",
+      "port": 5002,
+      "health": "http://127.0.0.1:5002/"
+    },
+    {
+      "id": "open-webui",
+      "name": "Open WebUI",
+      "subtitle": "chat front end (Docker)",
+      "group": "support",
+      "kind": "docker",
+      "container": "open-webui",
+      "port": 8080,
+      "health": "http://127.0.0.1:8080/",
+      "open_url": "http://127.0.0.1:8080"
+    }
+  ]
+}
