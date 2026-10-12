@@ -24,3 +24,7 @@ Options: `--config PATH` (default `backends.json`), `--host`, `--port`.
 ## Configure
 
 Edit `backends.json`. Each entry has an `id`, `name`, `group`, and a `kind` of `systemd`, `docker` or `process`. Entries with a `health` URL are probed to decide whether they are up; entries with an `openai_base` URL can be chatted with. The paths in the included file are examples from the author's machine; change them to match yours.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
