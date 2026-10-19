@@ -401,6 +401,27 @@ def live_chat_backend():
     return None
 
 
+# ---------- reasoning effort ----------
+# The chat box can ask for "low" or "xhigh" (Ultra High). Qwen3.8's own levels are low, medium and xhigh.
+# Ollama has its own vocabulary on /v1 (low, medium, high); its "high" is the top level Qwen3.8 offers.
+# llama.cpp-style servers take the template's own name through chat_template_kwargs.
+EFFORTS = {"low": ("low", "low"), "xhigh": ("high", "xhigh")}  # name -> (Ollama value, template value)
+
+
+def apply_effort(b, req):
+    """Turn the chat box's "effort" choice into the request fields this backend understands."""
+    choice = req.pop("effort", None)
+    if choice not in EFFORTS:
+        return  # "" or missing: leave the model's default alone
+    ollama_value, template_value = EFFORTS[choice]
+    if ollama_root(b):
+        req["reasoning_effort"] = ollama_value
+    else:
+        kwargs = dict(req.get("chat_template_kwargs") or {})
+        kwargs["reasoning_effort"] = template_value
+        req["chat_template_kwargs"] = kwargs
+
+
 # ---------- models: what the running chat backend offers and has loaded ----------
 _MODELS_CACHE = {}  # backend id -> (time, payload)
 
@@ -540,6 +561,7 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return self._json(400, {"error": "bad json"})
         req.setdefault("model", b.get("chat_model", "default"))
+        apply_effort(b, req)
         req["stream"] = True
         up = urllib.request.Request(b["openai_base"].rstrip("/") + "/chat/completions",
                                     data=json.dumps(req).encode(),

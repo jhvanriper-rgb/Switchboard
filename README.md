@@ -19,6 +19,7 @@ Options: `--config PATH` (default `backends.json`), `--host`, `--port`.
 - Start, stop and switch backends. Backends in the `gpu` group run one at a time; starting one stops the others.
 - Live GPU and system memory gauges and a 3-minute history chart.
 - Chat with the running backend. For Ollama, pick any installed model from a dropdown, see which one is loaded (size, context, GPU/CPU split), and unload it to free memory.
+- A "Thinking" choice next to the chat box: default, low, or ultra high. Ollama gets `reasoning_effort`; llama.cpp-style servers get it through `chat_template_kwargs`. The choice is remembered in the browser.
 - Per-backend logs.
 
 ## Configure

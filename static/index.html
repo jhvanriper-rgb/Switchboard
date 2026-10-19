@@ -110,6 +110,7 @@
   .msg .stat { color: var(--faint); font-size: 12px; margin-top: 4px; }
   .empty { color: var(--muted); margin: auto; text-align: center; max-width: 36ch; }
   .composer { border-top: 1px solid var(--line); padding: 10px; display: flex; gap: 8px; align-items: flex-end; }
+  .composer select { background: var(--panel2); color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 9px 8px; font: inherit; font-size: 13px; }
   .composer textarea { flex: 1; resize: none; background: var(--panel2); color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 9px 11px; font: inherit; max-height: 160px; }
 
   #logbox { flex: 1; margin: 0; padding: 14px 16px; overflow: auto; font: 12.5px/1.5 var(--mono); color: #b9ccd4; white-space: pre-wrap; overflow-wrap: anywhere; min-height: 240px; max-height: 52vh; }
@@ -155,6 +156,11 @@
         </div>
         <div id="msgs"><div class="empty" id="chatEmpty">Start a model that supports chat, then ask it something.</div></div>
         <div class="composer">
+          <select id="effortSel" aria-label="Reasoning effort" title="How long the model thinks before it answers">
+            <option value="">Thinking: default</option>
+            <option value="low">Thinking: low</option>
+            <option value="xhigh">Thinking: ultra high</option>
+          </select>
           <textarea id="input" rows="1" placeholder="Message the running model" aria-label="Message"></textarea>
           <button class="btn primary" id="send">Send</button>
           <button class="btn" id="halt" hidden>Stop</button>
@@ -362,6 +368,8 @@ function renderModelBar() {
   }
 }
 $("#modelSel").onchange = () => { store.set("sb.model." + models.backend, $("#modelSel").value); renderModelBar(); };
+$("#effortSel").value = store.get("sb.effort") || "";
+$("#effortSel").onchange = () => store.set("sb.effort", $("#effortSel").value);
 $("#unloadBtn").onclick = async () => { const m = $("#modelSel").value; if (m) { await post("/api/unload", {model: m}); pollModels(); } };
 async function pollModels() {
   try { const r = await fetch("/api/models"); models = await r.json(); } catch { return; }
@@ -388,6 +396,7 @@ async function send() {
   if (model && !loadedFor(model)) stat.textContent = "Loading " + shortId(model) + " into memory, the first reply can take a while";
   try {
     const payload = {messages: chatMsgs}; if (model) payload.model = model;
+    const effort = $("#effortSel").value; if (effort) payload.effort = effort;
     const r = await fetch("/api/chat", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(payload), signal: ctrl.signal});
     if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error(j.error || r.status); }
     const rd = r.body.getReader(), dec = new TextDecoder(); let buf = "";
