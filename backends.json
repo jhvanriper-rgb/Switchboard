@@ -1,5 +1,5 @@
 {
-  "_note": "Entries whose command contains TODO show as 'not set up' and cannot be started. Group 'gpu' means only one such entry runs at a time (starting one stops the others). Any other group runs alongside anything and is left alone by 'Stop all models'. Commands are split like a shell would (no pipes or &&); set \"shell\": true on an entry if you need those.",
+  "_note": "Entries whose command contains TODO show as 'not set up' and cannot be started. Group 'gpu' means only one such entry runs at a time (starting one stops the others). Any other group runs alongside anything and is left alone by 'Stop all models'. An entry with \"requires\": [ids] starts those first, and is stopped whenever one of them is stopped. Commands are split like a shell would (no pipes or &&); set \"shell\": true on an entry if you need those.",
   "port": 8090,
   "backends": [
     {
@@ -20,6 +20,7 @@
       "name": "DeepSeek Harness",
       "subtitle": "systemd service dsh",
       "group": "other",
+      "requires": ["ollama"],
       "kind": "systemd",
       "unit": "dsh",
       "use_pkexec": true,

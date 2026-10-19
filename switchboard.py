@@ -41,6 +41,24 @@ def configured(b):
     return not (b["kind"] == "process" and "TODO" in b.get("command", "TODO"))
 
 
+def requires_of(b):
+    """Ids of the backends this one cannot work without (optional "requires" list)."""
+    r = b.get("requires") or []
+    return [r] if isinstance(r, str) else [x for x in r if x in BACKENDS]
+
+
+def dependents_of(bid):
+    """Ids of the backends that need bid, directly or through another backend."""
+    out, todo = [], [bid]
+    while todo:
+        cur = todo.pop()
+        for oid, ob in BACKENDS.items():
+            if cur in requires_of(ob) and oid not in out and oid != bid:
+                out.append(oid)
+                todo.append(oid)
+    return out
+
+
 # ---------- probing ----------
 def http_ok(url, timeout=1.5):
     try:
@@ -126,6 +144,7 @@ def snapshot(bid):
             "chat": bool(b.get("openai_base")),
             "open_url": b.get("open_url"),
             "slow_start": bool(b.get("slow_start")),
+            "requires": [BACKENDS[r]["name"] for r in requires_of(b)],
         }
 
 
@@ -210,15 +229,39 @@ def _start_blocking(bid):
     raise RuntimeError("did not become ready in time; see logs")
 
 
-def switch_to(bid):
-    """Stop everything else in the same exclusive group, then start bid."""
+def stop_with_dependents(bid):
+    """Stop everything that needs bid first (it would only crash-loop without it), then bid."""
+    for did in dependents_of(bid):
+        d = BACKENDS[did]
+        if is_active(d) or STATE[did]["phase"] in ("starting", "running"):
+            try:
+                _stop_blocking(did)
+            except Exception:
+                pass  # keep going; the error shows on that backend
+    _stop_blocking(bid)
+
+
+def switch_to(bid, _seen=()):
+    """Start any backends bid requires, stop everything else in its exclusive group, then start bid."""
     b = BACKENDS[bid]
     try:
+        for rid in requires_of(b):
+            if rid in _seen or rid == bid:
+                raise RuntimeError("backends require each other in a loop; check backends.json")
+            rb = BACKENDS[rid]
+            if not configured(rb):
+                raise RuntimeError(f"{rb['name']} is needed first but is not configured")
+            if not ready(rb):
+                _set(rid, phase="starting", error=None, since=time.time())
+                switch_to(rid, _seen + (bid,))
+                if STATE[rid]["phase"] == "error" or not ready(rb):
+                    raise RuntimeError(f"{rb['name']} is needed first and did not start: {STATE[rid]['error'] or 'see logs'}")
         if b.get("group", "gpu") == "gpu":
+            keep = set(_seen) | set(requires_of(b))
             for oid, ob in BACKENDS.items():
-                if oid != bid and ob.get("group", "gpu") == "gpu":
+                if oid != bid and oid not in keep and ob.get("group", "gpu") == "gpu":
                     if is_active(ob) or STATE[oid]["phase"] in ("starting", "running"):
-                        _stop_blocking(oid)
+                        stop_with_dependents(oid)
                     elif ob.get("health") and http_ok(ob["health"]):
                         raise RuntimeError(f"{ob['name']} is running outside Switchboard; stop it first")
             time.sleep(2)  # let VRAM drain
@@ -259,7 +302,7 @@ def api_stop(bid):
             return 409, {"error": "busy"}
     def job():
         try:
-            _stop_blocking(bid)
+            stop_with_dependents(bid)
         except Exception:
             pass
     bg(job)
@@ -271,7 +314,7 @@ def api_stop_all():
         for bid, b in BACKENDS.items():
             if b.get("group", "gpu") == "gpu" and (is_active(b) or STATE[bid]["phase"] == "starting"):
                 try:
-                    _stop_blocking(bid)
+                    stop_with_dependents(bid)
                 except Exception:
                     pass
     bg(job)

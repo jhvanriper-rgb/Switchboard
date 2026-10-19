@@ -224,6 +224,7 @@ function renderRows() {
       }
       else if (b.phase === "unresponsive") sub = "Process is up but not answering yet";
       else if (b.phase === "error") { sub = b.error || "Failed"; s.classList.add("err"); }
+      if (b.requires && b.requires.length && b.phase !== "error" && b.configured) sub += (sub ? " · " : "") + "needs " + b.requires.join(", ");
       s.textContent = sub;
       t.append(n, s);
       const acts = document.createElement("div"); acts.className = "acts";
