@@ -19,7 +19,7 @@
       "id": "dsh",
       "name": "DeepSeek Harness",
       "subtitle": "systemd service dsh",
-      "group": "gpu",
+      "group": "other",
       "kind": "systemd",
       "unit": "dsh",
       "use_pkexec": true,
