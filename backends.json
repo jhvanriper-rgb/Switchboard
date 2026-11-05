@@ -18,8 +18,9 @@
         "kind": "github_release",
         "repo": "ollama/ollama",
         "version_command": "ollama --version",
-        "apply_command": "sh -c 'curl -fsSL https://ollama.com/install.sh | sh'",
-        "shell": true
+        "apply_command": "curl -fsSL https://ollama.com/install.sh | sh",
+        "shell": true,
+        "update_while_running": true
       }
     },
     {
@@ -157,7 +158,8 @@
       "open_url": "http://127.0.0.1:8080",
       "update": {
         "kind": "docker",
-        "image": "ghcr.io/open-webui/open-webui:main"
+        "image": "ghcr.io/open-webui/open-webui:main",
+        "check_at_startup": false
       }
     }
   ]

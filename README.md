@@ -33,9 +33,13 @@ Add an optional `update` object to any backend in `backends.json`. Backends with
 Kinds:
 
 - `{"kind": "git", "path": "/dir", "branch": "optional"}`. Check: `git fetch`, then count commits behind the upstream. A folder that is not a git checkout shows "no update source". Optional keys: `python` (a venv's python; if the repo has a `requirements.txt` it is installed with it), `post_command` (runs after a successful pull, in `post_cwd` or the repo; `post_shell: true` for pipes), `verify_command` (must exit 0 after the update).
-- `{"kind": "pip", "python": "/path/to/python", "package": "name"}`. Check: `pip list --outdated` (falls back to `pip index versions`). For `litellm` the checked-in file uses `"python": "python3"`; point it at LiteLLM's venv python if it lives in one.
-- `{"kind": "github_release", "repo": "owner/name", "version_command": "ollama --version", "apply_command": "...", "shell": false}`. Check: the first version number in the command output against the latest release tag on GitHub. Entries with `use_pkexec` run the apply command through `pkexec`.
-- `{"kind": "docker", "image": "repo/name:tag", "apply_command": "..."}`. Check: `docker pull` (the running container is untouched), then compare image ids. `apply_command` is the command you supply to recreate the container; without it the Update button does nothing and says "no recreate command set in backends.json".
+- `{"kind": "pip", "python": "/path/to/python", "package": "name"}`. Check: `pip list --outdated` (falls back to `pip index versions`). The checked-in file uses `"python": "python3"` for LiteLLM, but the system Python on Debian and Ubuntu refuses `pip install` (PEP 668), so set `"python"` to the virtualenv's python (for example `/home/james/litellm/venv/bin/python`) before you try to update it.
+- `{"kind": "github_release", "repo": "owner/name", "version_command": "ollama --version", "apply_command": "...", "shell": false}`. Check: the first version number in the command output against the latest release tag on GitHub. Entries with `use_pkexec` run the apply command through `pkexec`. The checked-in Ollama entry looks like this:
+
+      "update": {"kind": "github_release", "repo": "ollama/ollama", "version_command": "ollama --version",
+                 "apply_command": "curl -fsSL https://ollama.com/install.sh | sh", "shell": true,
+                 "update_while_running": true}
+- `{"kind": "docker", "image": "repo/name:tag", "apply_command": "..."}`. Check: `docker pull` (the running container is untouched), then compare image ids. `apply_command` is the command you supply to recreate the container; without it the Update button stays disabled and says "No recreate command set in backends.json." `docker pull` downloads the whole image, so the checked-in Open WebUI entry sets `"check_at_startup": false`: it is checked only when you press Check again.
 
 Each update is a pipeline of steps run in order, stopping at the first failure: **pull** (get the new version), **install** (make it usable), **verify** (prove it works). The panel shows progress live ("pull ok · install running"). Defaults per kind:
 
@@ -46,7 +50,9 @@ Each update is a pipeline of steps run in order, stopping at the first failure: 
 
 To override the defaults, give the update object `"steps": [{"name": "pull|install|verify", "command": "...", "cwd": "...", "shell": false, "timeout": 900, "pkexec": false}]`, or `"script": "/path/to/script.sh"` as shorthand for one install step. A verify step is always added at the end if your list does not end with one, so an update is never reported as done without a passing verify. A failed step marks the row "error" with the step name and the last 40 lines of output; if the failure came after the pull, the row can be run again once you fix the cause. Full output goes to the backend's log (for process backends).
 
-Rules: requests never carry commands, only `backends.json` does. Only one update runs at a time. Git, pip and docker backends must be stopped first ("Stop X first, then update it."); the Ollama installer restarts its own service, so it can run while Ollama is up. An update is refused if a git working tree has local changes.
+Rules: requests never carry commands, only `backends.json` does. Only one update runs at a time. A running backend must be stopped first ("Stop X first, then update it."), unless its update object sets `"update_while_running": true`; only Ollama does, because its installer restarts the service itself. If Switchboard cannot tell whether a backend is running, it assumes it is. An update and a check never run at the same time. An update is refused if a git working tree has local changes.
+
+Security: Switchboard only answers requests whose `Host` is `127.0.0.1`, `localhost` or `[::1]` (or the `--host` value) with its own port, refuses a foreign `Origin`, and requires the header `X-Switchboard: 1` on every POST. The page sends it for you; if you script the API with curl, add `-H 'X-Switchboard: 1'`. Binding to `--host 0.0.0.0` therefore only works when you browse to `0.0.0.0:<port>` itself.
 
 API: `GET /api/updates`, `POST /api/updates/check`, `POST /api/updates/apply/<id>`.
 

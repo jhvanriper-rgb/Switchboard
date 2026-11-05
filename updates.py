@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shlex
+import signal
 import subprocess
 import threading
 import time
@@ -31,26 +32,79 @@ NO_SOURCE = "no update source"
 ERROR = "error"
 
 KINDS = ("git", "pip", "github_release", "docker")
-# These must be stopped before updating. Ollama's installer restarts its own service.
-NEEDS_STOP = ("git", "pip", "docker")
+# A backend must be stopped before it is updated, unless its update object sets
+# "update_while_running": true (Ollama: its installer restarts the service itself).
 
+NO_SUCH = re.compile(r"no such (object|container)", re.I)
 _VERSION_RE = re.compile(r"\d+(?:\.\d+)+")
 
 
 # ---------- the two replaceable edges ----------
+def _kill_group(p):
+    """Stop a command and everything it started: SIGTERM, a short wait, then SIGKILL."""
+    try:
+        pgid = os.getpgid(p.pid)
+    except OSError:
+        pgid = None
+    for sig, wait in ((signal.SIGTERM, 2), (signal.SIGKILL, 2)):
+        try:
+            if pgid is not None:
+                os.killpg(pgid, sig)
+            else:
+                p.send_signal(sig)
+        except OSError:
+            pass
+        try:
+            p.wait(timeout=wait)
+            break
+        except subprocess.TimeoutExpired:
+            continue
+    if pgid is not None:  # make sure no grandchild survives the leader
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
 def run_command(argv, cwd=None, timeout=CMD_TIMEOUT, shell=False, env=None):
-    """Run one command, return (returncode, combined output). Never raises."""
+    """Run one command in its own process group, return (returncode, combined output).
+    On timeout the whole group is killed and (124, "command timed out") comes back.
+    Never raises."""
+    p = None
     try:
         full_env = {**os.environ, **(env or {})}
-        r = subprocess.run(argv, cwd=cwd, shell=shell, capture_output=True, text=True,
-                           timeout=timeout, stdin=subprocess.DEVNULL, env=full_env)
-        return r.returncode, ((r.stdout or "") + (r.stderr or "")).strip()
-    except subprocess.TimeoutExpired:
-        return 124, "command timed out"
+        p = subprocess.Popen(argv, cwd=cwd, shell=shell, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             text=True, stdin=subprocess.DEVNULL, env=full_env, start_new_session=True)
+        try:
+            out, _ = p.communicate(timeout=max(0.01, timeout))
+        except subprocess.TimeoutExpired:
+            _kill_group(p)
+            try:
+                p.communicate(timeout=2)
+            except Exception:  # noqa: BLE001
+                pass
+            return 124, "command timed out"
+        return p.returncode, (out or "").strip()
     except FileNotFoundError as e:
         return 127, f"command not found: {e.filename or e}"
     except Exception as e:  # noqa: BLE001 - must never escape
+        if p is not None and p.poll() is None:
+            _kill_group(p)
         return 1, str(e)
+
+
+_ctx = threading.local()  # holds the shared deadline of the check running in this thread
+
+
+def _cmd(argv, **kw):
+    """run_command with the current check's shared deadline applied (if any)."""
+    dl = getattr(_ctx, "deadline", None)
+    if dl is not None:
+        left = dl - time.monotonic()
+        if left <= 0:
+            return 124, "command timed out"
+        kw["timeout"] = min(kw.get("timeout", CMD_TIMEOUT), left)
+    return run_command(argv, **kw)
 
 
 def fetch_json(url, timeout=20):
@@ -149,7 +203,7 @@ def split_cmd(text, shell):
 
 # ---------- per-kind checks: return (status, detail) ----------
 def _git(path, *args, **kw):
-    return run_command(["git", "-C", path, *args], env={"GIT_TERMINAL_PROMPT": "0"}, **kw)
+    return _cmd(["git", "-C", path, *args], env={"GIT_TERMINAL_PROMPT": "0"}, **kw)
 
 
 def check_git(u):
@@ -182,7 +236,7 @@ def check_pip(u, meta=None):
     if not py or not pkg:
         return ERROR, 'pip update needs "python" and "package"'
     py = os.path.expanduser(py)
-    rc, out = run_command([py, "-m", "pip", "list", "--outdated", "--format=json"])
+    rc, out = _cmd([py, "-m", "pip", "list", "--outdated", "--format=json"])
     if rc == 0:
         try:
             hit = parse_pip_outdated(out, pkg)
@@ -192,7 +246,7 @@ def check_pip(u, meta=None):
             return AVAILABLE, f"{hit[0]} to {hit[1]}"
         except ValueError:
             pass  # fall through to the index lookup
-    rc2, out2 = run_command([py, "-m", "pip", "index", "versions", pkg])
+    rc2, out2 = _cmd([py, "-m", "pip", "index", "versions", pkg])
     if rc2 != 0:
         return ERROR, "pip check failed: " + tail_lines(out2 or out, 3)
     got = parse_pip_index(out2)
@@ -212,8 +266,11 @@ def check_github_release(u, meta=None):
     if not vc:
         return ERROR, 'github_release needs "version_command"'
     argv, sh = split_cmd(vc, bool(u.get("shell")))
-    rc, out = run_command(argv, shell=sh)
+    rc, out = _cmd(argv, shell=sh)
     installed = parse_version(out) if rc == 0 else None
+    dl = getattr(_ctx, "deadline", None)
+    if dl is not None and dl - time.monotonic() <= 0:
+        return ERROR, "check timed out"
     tag = fetch_json(f"https://api.github.com/repos/{repo}/releases/latest").get("tag_name", "")
     meta.update(installed=installed, latest=parse_version(tag))
     return decide_version(installed, parse_version(tag))
@@ -224,34 +281,43 @@ def check_docker(u, b, meta=None):
     image, container = u.get("image"), b.get("container")
     if not image or not container:
         return ERROR, 'docker update needs "image" and a "container" on the entry'
-    rc, out = run_command(["docker", "pull", image])
+    rc, out = _cmd(["docker", "pull", image])
     if rc != 0:
         return ERROR, "docker pull failed: " + tail_lines(out, 3)
-    rc, new_id = run_command(["docker", "image", "inspect", "--format", "{{.Id}}", image])
-    rc2, cid = run_command(["docker", "inspect", "--format", "{{.Image}}", container])
+    rc, new_id = _cmd(["docker", "image", "inspect", "--format", "{{.Id}}", image])
+    rc2, cid = _cmd(["docker", "inspect", "--format", "{{.Image}}", container])
     meta["new_id"] = new_id.strip() if rc == 0 else ""
+    if rc2 != 0 and not NO_SUCH.search(cid or ""):
+        return ERROR, "could not inspect the container: " + last_line(cid)
     return decide_image(meta["new_id"], cid.strip() if rc2 == 0 else "")
 
 
-def run_check(b, meta=None):
+def run_check(b, meta=None, budget=CHECK_TIMEOUT):
     """One entry's check, as (status, detail). Never raises. meta, if given, is filled with
-    what the verify step needs (expected version, new image id)."""
+    what the verify step needs (expected version, new image id). All of the check's commands
+    share one deadline of `budget` seconds."""
     u = b.get("update")
+    deadline = time.monotonic() + budget
+    _ctx.deadline = deadline
     try:
         kind = u.get("kind")
         if kind == "git":
-            return check_git(u)
-        if kind == "pip":
-            return check_pip(u, meta)
-        if kind == "github_release":
-            return check_github_release(u, meta)
-        if kind == "docker":
-            return check_docker(u, b, meta)
-        return ERROR, f"unknown update kind {kind!r}"
+            res = check_git(u)
+        elif kind == "pip":
+            res = check_pip(u, meta)
+        elif kind == "github_release":
+            res = check_github_release(u, meta)
+        elif kind == "docker":
+            res = check_docker(u, b, meta)
+        else:
+            res = (ERROR, f"unknown update kind {kind!r}")
     except Exception as e:  # noqa: BLE001
-        return ERROR, str(e)[:200] or type(e).__name__
-
-
+        res = (ERROR, str(e)[:200] or type(e).__name__)
+    finally:
+        _ctx.deadline = None
+    if res[0] == ERROR and time.monotonic() >= deadline:
+        return ERROR, "check timed out"
+    return res
 
 
 # ---------- update steps: pull, install, verify ----------
@@ -259,10 +325,13 @@ class Step:
     """One named step. run() returns (ok, output, text): text is the reason on failure and a
     short note on success."""
 
-    def __init__(self, name, run):
-        self.name, self.run = name, run
+    def __init__(self, name, run, safe_on_fail=False):
+        # safe_on_fail: if this step fails nothing has changed (git pull --ff-only, docker pull)
+        self.name, self.run, self.safe_on_fail = name, run, safe_on_fail
 
 
+RECREATE_MISSING = "No recreate command set in backends.json."
+APPLY_MISSING = "No apply command set in backends.json."
 STEP_NAMES = ("pull", "install", "verify")
 STEP_TIMEOUT = 900
 
@@ -281,11 +350,11 @@ def cmd_result(rc, out, timeout):
     return True, out, last_line(out)
 
 
-def cmd_step(name, argv, cwd=None, shell=False, timeout=STEP_TIMEOUT, env=None):
+def cmd_step(name, argv, cwd=None, shell=False, timeout=STEP_TIMEOUT, env=None, safe_on_fail=False):
     def run():
         rc, out = run_command(argv, cwd=cwd, shell=shell, timeout=timeout, env=env)
         return cmd_result(rc, out, timeout)
-    return Step(name, run)
+    return Step(name, run, safe_on_fail)
 
 
 def git_upstream(u):
@@ -310,7 +379,7 @@ def git_steps(b, u, meta):
     path = os.path.expanduser(u.get("path", ""))
     pull_args = ["pull", "--ff-only"] + (["origin", u["branch"]] if u.get("branch") else [])
     steps = [cmd_step("pull", ["git", "-C", path, *pull_args], env={"GIT_TERMINAL_PROMPT": "0"},
-                      timeout=APPLY_TIMEOUT)]
+                      timeout=APPLY_TIMEOUT, safe_on_fail=True)]
     parts = []
     req = os.path.join(path, "requirements.txt")
     if u.get("python") and os.path.isfile(req):
@@ -392,6 +461,8 @@ def verify_docker(u, b):
     if rc != 0 or not new:
         return False, new, "could not read the downloaded image id"
     rc2, cid = run_command(["docker", "inspect", "--format", "{{.Image}}", b["container"]], timeout=CMD_TIMEOUT)
+    if rc2 != 0 and not NO_SUCH.search(cid or ""):
+        return False, cid, "could not inspect the container: " + last_line(cid)
     if rc2 == 0 and cid.strip() != new:
         return False, f"image {new}\ncontainer {cid.strip()}", "the container still runs the old image"
     note = "container runs the new image" if rc2 == 0 else "image downloaded; no container exists yet"
@@ -399,7 +470,7 @@ def verify_docker(u, b):
 
 
 def docker_steps(b, u, meta):
-    steps = [cmd_step("pull", ["docker", "pull", u["image"]], timeout=APPLY_TIMEOUT)]
+    steps = [cmd_step("pull", ["docker", "pull", u["image"]], timeout=APPLY_TIMEOUT, safe_on_fail=True)]
     if u.get("apply_command"):
         argv, sh = split_cmd(u["apply_command"], bool(u.get("shell")))
         steps.append(cmd_step("install", argv, shell=sh, timeout=APPLY_TIMEOUT))
@@ -493,7 +564,7 @@ def precheck_apply(b):
         if out.strip():
             return f"{b['name']} has local changes in {path}. Commit or stash them first."
     if not custom and kind in ("docker", "github_release") and not u.get("apply_command"):
-        return "no recreate command set in backends.json" if kind == "docker" else "no apply command set in backends.json"
+        return RECREATE_MISSING if kind == "docker" else APPLY_MISSING
     try:
         build_steps(b, {})
     except (ValueError, KeyError) as e:
@@ -532,6 +603,7 @@ class Updater:
         self._cache = {}  # id -> status, detail, checked_at, meta, steps, incomplete
         self._checking = False
         self._applying = None  # id being updated
+        self._epoch = 0  # bumped when an update finishes; older check results are dropped
         self._apply_lock = threading.Lock()
 
     # -- helpers
@@ -542,7 +614,7 @@ class Updater:
         try:
             return bool(self._is_running(bid))
         except Exception:  # noqa: BLE001
-            return False
+            return True  # fail safe: if we cannot tell, assume it is running
 
     def _store(self, bid, status, detail, **extra):
         with self._lock:
@@ -552,7 +624,7 @@ class Updater:
                                 "incomplete": extra.get("incomplete", old.get("incomplete"))}
 
     def _stop_reason(self, b):
-        if b["update"].get("kind") in NEEDS_STOP and self._running(b["id"]):
+        if not b["update"].get("update_while_running") and self._running(b["id"]):
             return f"Stop {b['name']} first, then update it."
         return None
 
@@ -572,13 +644,17 @@ class Updater:
                 running = self._running(bid)
                 reason = None
                 if self._applicable(c) and applying != bid:
-                    reason = self._stop_reason(b)
-                    if applying and not reason:
-                        reason = "Another update is running."
                     u = b["update"]
-                    if (not reason and u.get("kind") in ("docker", "github_release") and not u.get("apply_command")
-                            and u.get("steps") is None and not u.get("script")):
-                        reason = "No apply command set in backends.json."
+                    reason = self._stop_reason(b)
+                    if not reason and checking:
+                        reason = "A check is running."
+                    if not reason and applying:
+                        reason = "Another update is running."
+                    if not reason and u.get("steps") is None and not u.get("script") and not u.get("apply_command"):
+                        if u.get("kind") == "docker":
+                            reason = RECREATE_MISSING
+                        elif u.get("kind") == "github_release":
+                            reason = APPLY_MISSING
                 steps = list(c.get("steps") or [])
                 items.append({"id": bid, "name": b["name"], "status": c["status"], "detail": c["detail"],
                               "checked_at": c["checked_at"], "running": running,
@@ -595,13 +671,14 @@ class Updater:
         with self._lock:
             if self._applying == bid:
                 return
+            epoch = self._epoch
             if bid not in self._cache:
                 self._cache[bid] = {"status": CHECKING, "detail": "", "checked_at": None, "meta": {}, "steps": []}
         meta = {}
-        status, detail = _with_timeout(lambda: run_check(b, meta), self._timeout)
+        status, detail = _with_timeout(lambda: run_check(b, meta, self._timeout), self._timeout + 5)
         with self._lock:
-            if self._applying == bid:
-                return
+            if self._applying is not None or self._epoch != epoch:
+                return  # an update ran meanwhile; this result may be stale
             old = self._cache.get(bid) or {}
             inc = old.get("incomplete")
             if inc and status == UP_TO_DATE:
@@ -609,28 +686,38 @@ class Updater:
                 detail = f"Last update stopped at {inc['step']}: {inc['reason']}\nFix that, then click Update to run the steps again."
             self._store(bid, status, detail, meta=meta, steps=old.get("steps", []) if inc else [])
 
-    def check_all(self):
-        """Check every entry one at a time (blocking). Returns False if a run was already going."""
+    def check_all(self, startup=False):
+        """Check every entry one at a time (blocking). Returns False if a run was already going
+        or an update is running. At startup, entries with "check_at_startup": false are skipped."""
         with self._lock:
-            if self._checking:
+            if self._checking or self._applying:
                 return False
             self._checking = True
-            for bid in self.entries():
+            todo = []
+            for bid, b in self.entries().items():
+                if startup and b["update"].get("check_at_startup") is False:
+                    self._cache.setdefault(bid, {"status": UNKNOWN, "checked_at": None, "meta": {}, "steps": [],
+                                                 "detail": "Not checked at startup. Press Check again."})
+                    continue
                 self._cache.setdefault(bid, {"status": CHECKING, "detail": "", "checked_at": None, "meta": {}, "steps": []})
+                todo.append(bid)
         try:
-            for bid in list(self.entries()):
+            for bid in todo:
                 self._check_one(bid)
         finally:
             with self._lock:
                 self._checking = False
         return True
 
-    def check_all_async(self):
+    def check_all_async(self, startup=False):
+        """Start a background check. Returns (code, body)."""
         with self._lock:
+            if self._applying:
+                return 409, {"error": "An update is running. Check again when it finishes."}
             if self._checking:
-                return False
-        threading.Thread(target=self.check_all, daemon=True).start()
-        return True
+                return 202, {"ok": True}
+        threading.Thread(target=self.check_all, kwargs={"startup": startup}, daemon=True).start()
+        return 202, {"ok": True}
 
     # -- applying
     def apply(self, bid, background=True):
@@ -651,9 +738,11 @@ class Updater:
             refusal = str(e)[:200]
         if refusal:
             return 409, {"error": refusal}
-        if not self._apply_lock.acquire(blocking=False):
-            return 409, {"error": "Another update is running. Wait for it to finish."}
         with self._lock:
+            if self._checking:
+                return 409, {"error": "A check is running, try again in a moment."}
+            if not self._apply_lock.acquire(blocking=False):
+                return 409, {"error": "Another update is running. Wait for it to finish."}
             self._applying = bid
         if background:
             threading.Thread(target=self._apply_job, args=(bid, b), daemon=True).start()
@@ -676,7 +765,7 @@ class Updater:
                 inc = old.get("incomplete")
             try:
                 if not meta:
-                    run_check(b, meta)  # read-only; fills in what the verify step compares with
+                    run_check(b, meta, self._timeout)  # read-only; fills in what verify compares with
                 steps = build_steps(b, meta)
             except Exception as e:  # noqa: BLE001
                 self._store(bid, ERROR, f"Could not start the update: {e}")
@@ -693,15 +782,27 @@ class Updater:
                     pass
             tail = tail_lines(out)
             if not ok:
-                idx = next((i for i, s in enumerate(prog) if s["name"] == name), 0)
-                marker = {"step": name, "reason": reason} if idx > 0 else inc
-                self._store(bid, ERROR, f"{name} failed: {reason}\n{tail}", steps=prog, incomplete=marker)
+                idx = next((i for i, s in enumerate(prog) if s["state"] == "failed"), 0)
+                safe = steps[idx].safe_on_fail if idx < len(steps) else False
+                if safe:  # nothing changed, so there is nothing half-done to finish later
+                    self._store(bid, ERROR, f"{name} failed: {reason}\nNothing was changed. Press Check again to retry.\n{tail}",
+                                steps=prog, incomplete=inc)
+                else:
+                    self._store(bid, ERROR, f"{name} failed: {reason}\n{tail}", steps=prog,
+                                incomplete={"step": name, "reason": reason})
                 return
             meta2 = {}
-            status, detail = _with_timeout(lambda: run_check(b, meta2), self._timeout)
-            self._store(bid, status, (detail + "\n\n" if detail else "") + f"Updated and verified ({progress_text(prog)}).\n" + tail,
+            status, detail = _with_timeout(lambda: run_check(b, meta2, self._timeout), self._timeout + 5)
+            done = f"Updated and verified ({progress_text(prog)})."
+            if status == ERROR:  # the update itself passed verify; only the recheck failed
+                status = UP_TO_DATE
+                done += f" The check afterward failed: {detail}"
+                detail = ""
+            self._store(bid, status, done + ("\n" + detail if detail else "") + "\n" + tail,
                         meta=meta2, steps=prog, incomplete=None)
         finally:
             with self._lock:
                 self._applying = None
+                self._epoch += 1
             self._apply_lock.release()
+

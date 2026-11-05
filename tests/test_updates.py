@@ -16,6 +16,9 @@ import switchboard as sb  # noqa: E402
 import updates as up  # noqa: E402
 
 
+ORIGINALS = (up.run_command, up.fetch_json)
+
+
 class FakeRun:
     """Replacement for updates.run_command. `script` maps a substring of the joined command
     to (rc, output); the first match wins. Every call is recorded."""
@@ -33,8 +36,10 @@ class FakeRun:
 
 
 class Patched(unittest.TestCase):
+    def setUp(self):
+        self.addCleanup(self._restore)
+
     def patch(self, fake=None, fetch=None):
-        self._old = (up.run_command, up.fetch_json)
         if fake is not None:
             up.run_command = fake
         if fetch is not None:
@@ -42,7 +47,7 @@ class Patched(unittest.TestCase):
         self.addCleanup(self._restore)
 
     def _restore(self):
-        up.run_command, up.fetch_json = self._old
+        up.run_command, up.fetch_json = ORIGINALS
 
 
 def backends(**over):
@@ -144,6 +149,30 @@ class Checks(Patched):
                             ("docker inspect", (0, "sha256:old"))]))
         self.assertEqual(up.run_check(backends()["dock"])[0], up.AVAILABLE)
 
+    def test_docker_check_container_errors_other_than_missing_are_errors(self):
+        self.patch(FakeRun([("docker pull", (0, "ok")), ("image inspect", (0, "sha256:new")),
+                            ("docker inspect", (1, "Cannot connect to the Docker daemon"))]))
+        self.assertEqual(up.run_check(backends()["dock"])[0], up.ERROR)
+        self.patch(FakeRun([("docker pull", (0, "ok")), ("image inspect", (0, "sha256:new")),
+                            ("docker inspect", (1, "Error: No such object: c1"))]))
+        self.assertEqual(up.run_check(backends()["dock"])[0], up.UNKNOWN)
+
+    def test_all_commands_of_a_check_share_one_deadline(self):
+        calls = []
+
+        def slow(argv, **kw):
+            calls.append(kw.get("timeout"))
+            return 124, "command timed out"
+        self.patch(slow)
+        status, detail = up.run_check(backends()["pip"], budget=30)
+        self.assertEqual(status, up.ERROR)
+        # every command got at most what was left of the 30 s budget
+        self.assertTrue(all(t is not None and t <= 30 for t in calls))
+        # an already-spent budget runs nothing at all
+        calls.clear()
+        self.assertEqual(up.run_check(backends()["pip"], budget=0), (up.ERROR, "check timed out"))
+        self.assertEqual(calls, [])
+
     def test_hung_check_times_out(self):
         gate = threading.Event()
         self.addCleanup(gate.set)
@@ -219,6 +248,15 @@ class StepRunner(Patched):
         self.patch(FakeRun([("image inspect", (0, "sha:new")), ("docker inspect", (0, "sha:new"))]))
         self.assertTrue(up.verify_docker(b["update"], b)[0])
 
+    def test_docker_verify_no_container_only_passes_for_no_such_object(self):
+        b = backends()["dock"]
+        self.patch(FakeRun([("image inspect", (0, "sha:new")), ("docker inspect", (1, "Error: No such object: c1"))]))
+        self.assertTrue(up.verify_docker(b["update"], b)[0])
+        self.patch(FakeRun([("image inspect", (0, "sha:new")), ("docker inspect", (1, "permission denied"))]))
+        ok, _, reason = up.verify_docker(b["update"], b)
+        self.assertFalse(ok)
+        self.assertIn("could not inspect", reason)
+
     def test_custom_steps_override_and_still_end_with_verify(self):
         b = backends()["git"]
         b["update"]["steps"] = [{"name": "pull", "command": "./go.sh", "cwd": "/tmp", "timeout": 5}]
@@ -267,10 +305,21 @@ class UpdaterTests(Patched):
             self.assertEqual(obj["error"], f"Stop {backends()[bid]['name']} first, then update it.")
             self.assertEqual(fake.calls, [])  # nothing ran
 
-    def test_ollama_style_release_may_apply_while_running(self):
+    def test_release_refused_while_running_without_the_flag(self):
+        fake = FakeRun()
+        self.patch(fake)
+        u = self.make(running=("rel",))
+        self.seed(u, "rel", meta={"latest": (0, 5, 2)})
+        code, obj = u.apply("rel", background=False)
+        self.assertEqual((code, obj["error"]), (409, "Stop Rel first, then update it."))
+        self.assertEqual(fake.calls, [])
+
+    def test_update_while_running_flag_allows_apply_while_running(self):
         fake = FakeRun([("tool --version", (0, "tool 0.5.2")), ("install-tool", (0, "installed"))])
         self.patch(fake, lambda url: {"tag_name": "0.5.2"})
-        u = self.make(running=("rel",))
+        bk = backends()
+        bk["rel"]["update"]["update_while_running"] = True
+        u = self.make(running=("rel",), bk=bk)
         self.seed(u, "rel", meta={"latest": (0, 5, 2)})
         self.assertEqual(u.apply("rel", background=False)[0], 202)
         item = next(i for i in u.snapshot()["items"] if i["id"] == "rel")
@@ -303,7 +352,10 @@ class UpdaterTests(Patched):
         u = self.make(bk=bk)
         self.seed(u, "dock")
         code, obj = u.apply("dock", background=False)
-        self.assertEqual((code, obj["error"]), (409, "no recreate command set in backends.json"))
+        self.assertEqual((code, obj["error"]), (409, "No recreate command set in backends.json."))
+        snap = next(i for i in u.snapshot()["items"] if i["id"] == "dock")
+        self.assertEqual(snap["reason"], "No recreate command set in backends.json.")
+        self.assertFalse(snap["can_apply"])
         self.assertEqual(fake.calls, [])
 
     def test_only_one_apply_at_a_time(self):
@@ -354,7 +406,8 @@ class UpdaterTests(Patched):
         self.assertEqual(item["status"], up.ERROR)
         self.assertTrue(item["detail"].startswith("pull failed"))
         self.assertFalse(any("rev-parse HEAD" in c for c in fake.calls))
-        self.assertFalse(item["can_apply"] and "incomplete" in item["detail"])
+        self.assertFalse(item["can_apply"])  # nothing changed, so there is nothing to finish
+        self.assertIn("Press Check again to retry.", item["detail"])
 
     def test_incomplete_update_is_not_reported_up_to_date_by_a_recheck(self):
         fake = FakeRun([("pip show", (0, "Version: 1.0.0")), ("install --upgrade", (0, "ok")),
@@ -370,13 +423,25 @@ class UpdaterTests(Patched):
 
     def test_check_all_one_at_a_time_and_caches(self):
         order = []
+        active = []
+        overlap = []
 
         def fake(argv, **kw):
-            order.append(argv[0] if isinstance(argv, list) else argv)
+            text = argv if isinstance(argv, str) else " ".join(argv)
+            kind = ("rel" if "tool --version" in text else "pip" if "pip" in text
+                    else "dock" if "docker" in text else "git")
+            if not order or order[-1] != kind:
+                order.append(kind)
+            active.append(kind)
+            if len(set(active)) > 1:
+                overlap.append(kind)
+            active.clear()
             return 0, ""
         self.patch(fake, lambda url: {"tag_name": "1.0.0"})
         u = self.make()
         self.assertTrue(u.check_all())
+        self.assertEqual(order, ["git", "pip", "rel", "dock"])  # one entry at a time, in file order
+        self.assertEqual(overlap, [])
         snap = u.snapshot()
         self.assertFalse(snap["checking"])
         self.assertTrue(all(i["checked_at"] for i in snap["items"]))
@@ -389,6 +454,8 @@ class HttpApi(Patched):
         bk = backends()
         u = up.Updater(lambda: bk, lambda bid: False)
         u._store("pip", up.UP_TO_DATE, "x")  # not applicable, so nothing may run
+        u._store("git", up.AVAILABLE, "x")  # applicable, but running, so nothing may run
+        u._is_running = lambda bid: True
         old = sb.UPDATER
         sb.UPDATER = u
         self.addCleanup(lambda: setattr(sb, "UPDATER", old))
@@ -403,7 +470,7 @@ class HttpApi(Patched):
 
         def post(path, body=None):
             req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", data=json.dumps(body or {}).encode(),
-                                         method="POST", headers={"Content-Type": "application/json"})
+                                         method="POST", headers={"Content-Type": "application/json", "X-Switchboard": "1"})
             try:
                 with urllib.request.urlopen(req, timeout=5) as r:
                     return r.status, json.loads(r.read())
@@ -413,6 +480,7 @@ class HttpApi(Patched):
         evil = {"command": "touch /tmp/pwned", "apply_command": "rm -rf /", "shell": True, "steps": [{"name": "pull", "command": "id"}]}
         self.assertEqual(post("/api/updates/apply/nope", evil)[0], 404)
         self.assertEqual(post("/api/updates/apply/pip", evil)[0], 409)
+        self.assertEqual(post("/api/updates/apply/git", evil)[0], 409)
         self.assertEqual(post("/api/updates/apply/plain", evil)[0], 404)
         self.assertEqual(fake.calls, [])
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/updates", timeout=5) as r:
@@ -421,6 +489,293 @@ class HttpApi(Patched):
         self.assertEqual({i["id"] for i in data["items"]}, {"git", "pip", "rel", "dock"})
         for key in ("id", "name", "status", "detail", "checked_at", "running", "can_apply"):
             self.assertIn(key, data["items"][0])
+
+
+def alive(pid):
+    """Is the process still running (a zombie that only waits to be reaped does not count)?"""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return False
+    return stat.rsplit(")", 1)[1].split()[0] != "Z"
+
+
+class RealProcessGroup(unittest.TestCase):
+    def test_timeout_kills_the_whole_process_group_and_returns_promptly(self):
+        import tempfile
+        import time
+        with tempfile.TemporaryDirectory() as d:
+            pidfile = Path(d) / "pid"
+            t0 = time.monotonic()
+            rc, out = up.run_command(["sh", "-c", f"sleep 30 & echo $! > {pidfile}; sleep 30"], timeout=1)
+            took = time.monotonic() - t0
+            self.assertEqual(rc, 124)
+            self.assertEqual(out, "command timed out")
+            self.assertLess(took, 8)
+            pid = int(pidfile.read_text())
+            for _ in range(40):
+                if not alive(pid):
+                    break
+                time.sleep(0.1)
+            self.assertFalse(alive(pid), "the background child survived the timeout")
+
+    def test_normal_command_returns_output(self):
+        rc, out = up.run_command(["sh", "-c", "echo hi; echo err 1>&2; exit 3"])
+        self.assertEqual(rc, 3)
+        self.assertIn("hi", out)
+        self.assertIn("err", out)
+
+    def test_missing_program_is_a_result_not_an_exception(self):
+        rc, out = up.run_command(["definitely-not-a-program-xyz"])
+        self.assertEqual(rc, 127)
+
+
+class RealGit(unittest.TestCase):
+    """Uses real git on repositories made in a temp dir. No network (the remote is a local path)."""
+
+    def setUp(self):
+        import shutil
+        import subprocess
+        import tempfile
+        if not shutil.which("git"):
+            self.skipTest("git not installed")
+        self.dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.env = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com",
+                    "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com",
+                    "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}
+        import os
+        self._sub = subprocess
+        self.environ = {**os.environ, **self.env}
+        self.remote = self.dir / "remote.git"
+        self.g(self.dir, "init", "-q", "--bare", str(self.remote))
+        self.g(self.dir, "symbolic-ref", "HEAD", "refs/heads/main", cwd_git=self.remote)
+        self.app = self.clone("app")
+        self.commit(self.app, "a.txt", "one")
+        self.g(self.app, "push", "-q", "origin", "HEAD:main")
+        self.g(self.app, "branch", "--set-upstream-to=origin/main")
+        self.other = self.clone("other")
+
+    def g(self, cwd, *args, cwd_git=None):
+        r = self._sub.run(["git", *args] if cwd_git is None else ["git", "-C", str(cwd_git), *args],
+                          cwd=str(cwd), env=self.environ, capture_output=True, text=True)
+        if r.returncode != 0:
+            self.fail(f"git {args} failed: {r.stderr}")
+        return r.stdout.strip()
+
+    def clone(self, name):
+        path = self.dir / name
+        self.g(self.dir, "init", "-q", str(path))
+        self.g(path, "checkout", "-q", "-b", "main")
+        self.g(path, "remote", "add", "origin", str(self.remote))
+        return path
+
+    def commit(self, repo, name, text):
+        (repo / name).write_text(text)
+        self.g(repo, "add", name)
+        self.g(repo, "commit", "-q", "-m", f"change {name} {text}")
+
+    def updater(self):
+        bk = {"app": {"id": "app", "name": "App", "kind": "process",
+                      "update": {"kind": "git", "path": str(self.app)}}}
+        return up.Updater(lambda: bk, lambda bid: False)
+
+    def publish_from_other(self, name="b.txt", text="two"):
+        self.g(self.other, "pull", "-q", "origin", "main")
+        self.commit(self.other, name, text)
+        self.g(self.other, "push", "-q", "origin", "HEAD:main")
+
+    def snap(self, u):
+        return u.snapshot()["items"][0]
+
+    def test_clean_fast_forward_succeeds(self):
+        self.publish_from_other()
+        u = self.updater()
+        u.check_all()
+        self.assertEqual(self.snap(u)["status"], up.AVAILABLE)
+        self.assertEqual(self.snap(u)["detail"], "1 commit behind")
+        self.assertEqual(u.apply("app", background=False)[0], 202)
+        item = self.snap(u)
+        self.assertEqual(item["status"], up.UP_TO_DATE)
+        self.assertIn("verify ok", item["progress"])
+        self.assertEqual(self.g(self.app, "rev-parse", "HEAD"), self.g(self.remote, "rev-parse", "main"))
+
+    def test_diverged_history_fails_and_leaves_head_unchanged(self):
+        self.commit(self.app, "local.txt", "mine")
+        self.publish_from_other()
+        before = self.g(self.app, "rev-parse", "HEAD")
+        u = self.updater()
+        u.check_all()
+        self.assertEqual(self.snap(u)["status"], up.AVAILABLE)
+        self.assertEqual(u.apply("app", background=False)[0], 202)
+        item = self.snap(u)
+        self.assertEqual(item["status"], up.ERROR)
+        self.assertIn("pull failed", item["detail"])
+        self.assertIn("Press Check again to retry.", item["detail"])
+        self.assertFalse(item["can_apply"])
+        self.assertEqual(self.g(self.app, "rev-parse", "HEAD"), before)
+
+    def test_dirty_tree_is_refused_and_nothing_changes(self):
+        self.publish_from_other()
+        u = self.updater()
+        u.check_all()
+        (self.app / "a.txt").write_text("edited by hand")
+        before = self.g(self.app, "rev-parse", "HEAD")
+        code, obj = u.apply("app", background=False)
+        self.assertEqual(code, 409)
+        self.assertIn("local changes", obj["error"])
+        self.assertEqual(self.g(self.app, "rev-parse", "HEAD"), before)
+
+    def test_not_a_checkout_is_no_update_source(self):
+        plain = self.dir / "plain"
+        plain.mkdir()
+        self.assertEqual(up.check_git({"kind": "git", "path": str(plain)})[0], up.NO_SOURCE)
+
+
+class SafetyRules(Patched):
+    def make(self, **kw):
+        return up.Updater(lambda: backends(), kw.get("is_running", lambda bid: False))
+
+    def test_unreadable_running_state_counts_as_running(self):
+        def boom(bid):
+            raise RuntimeError("docker is down")
+        fake = FakeRun()
+        self.patch(fake)
+        u = self.make(is_running=boom)
+        u._store("git", up.AVAILABLE, "x")
+        code, obj = u.apply("git", background=False)
+        self.assertEqual(code, 409)
+        self.assertIn("Stop GitApp first", obj["error"])
+        self.assertTrue(next(i for i in u.snapshot()["items"] if i["id"] == "git")["running"])
+        self.assertEqual(fake.calls, [])
+
+    def test_apply_refused_while_a_check_is_running(self):
+        fake = FakeRun()
+        self.patch(fake)
+        u = self.make()
+        u._store("pip", up.AVAILABLE, "x")
+        u._checking = True
+        code, obj = u.apply("pip", background=False)
+        self.assertEqual((code, obj["error"]), (409, "A check is running, try again in a moment."))
+        item = next(i for i in u.snapshot()["items"] if i["id"] == "pip")
+        self.assertFalse(item["can_apply"])
+        self.assertEqual(fake.calls, [])
+
+    def test_check_refused_while_an_update_is_running(self):
+        u = self.make()
+        u._applying = "pip"
+        self.assertFalse(u.check_all())
+        self.assertEqual(u.check_all_async()[0], 409)
+
+    def test_a_check_that_straddles_an_update_is_not_stored(self):
+        u = self.make()
+        u._store("git", up.AVAILABLE, "before")
+        real = up.run_check
+
+        def straddling(b, meta=None, budget=60):
+            u._epoch += 1  # an update finished while this check was running
+            return up.UP_TO_DATE, "stale"
+        up.run_check = straddling
+        self.addCleanup(setattr, up, "run_check", real)
+        u._check_one("git")
+        self.assertEqual(u._cache["git"]["detail"], "before")
+
+    def test_failure_after_the_pull_keeps_the_update_open_but_a_failed_pull_does_not(self):
+        bk = backends()
+        bk["git"]["update"]["post_command"] = "make"
+        fake = FakeRun([("pull --ff-only", (0, "ok")), ("make", (2, "boom"))])
+        self.patch(fake)
+        u = up.Updater(lambda: bk, lambda bid: False)
+        u._store("git", up.AVAILABLE, "x")
+        u.apply("git", background=False)
+        item = next(i for i in u.snapshot()["items"] if i["id"] == "git")
+        self.assertEqual(item["status"], up.ERROR)
+        self.assertIn("install failed", item["detail"])
+        self.assertTrue(item["can_apply"])
+
+    def test_failed_recheck_after_a_verified_update_still_counts_as_success(self):
+        fake = FakeRun([("pip show", (0, "Version: 1.2.0")), ("install --upgrade", (0, "ok")),
+                        ("list --outdated", (1, "network down")), ("index versions", (1, "network down"))])
+        self.patch(fake)
+        u = self.make()
+        u._store("pip", up.AVAILABLE, "x", meta={"installed": (1, 0), "latest": (1, 2, 0)})
+        u.apply("pip", background=False)
+        item = next(i for i in u.snapshot()["items"] if i["id"] == "pip")
+        self.assertEqual(item["status"], up.UP_TO_DATE)
+        self.assertTrue(item["detail"].startswith("Updated and verified"))
+        self.assertIn("check afterward failed", item["detail"])
+
+    def test_startup_skips_entries_that_opt_out(self):
+        bk = backends()
+        bk["dock"]["update"]["check_at_startup"] = False
+        fake = FakeRun()
+        self.patch(fake, lambda url: {"tag_name": "1.0.0"})
+        u = up.Updater(lambda: bk, lambda bid: False)
+        u.check_all(startup=True)
+        self.assertFalse(any("docker" in c for c in fake.calls))
+        item = next(i for i in u.snapshot()["items"] if i["id"] == "dock")
+        self.assertEqual(item["status"], up.UNKNOWN)
+        u.check_all()  # "Check again" does check it
+        self.assertTrue(any("docker pull" in c for c in fake.calls))
+
+
+class RequestGuard(Patched):
+    def setUp(self):
+        self.patch(FakeRun())
+        bk = backends()
+        old = sb.UPDATER
+        sb.UPDATER = up.Updater(lambda: bk, lambda bid: False)
+        self.addCleanup(lambda: setattr(sb, "UPDATER", old))
+        self.srv = ThreadingHTTPServer(("127.0.0.1", 0), sb.Handler)
+        self.port = self.srv.server_address[1]
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        self.addCleanup(self.srv.server_close)
+        self.addCleanup(self.srv.shutdown)
+
+    def req(self, method, path, headers=None, host="default"):
+        import http.client
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        c.putrequest(method, path, skip_host=True)
+        c.putheader("Host", f"127.0.0.1:{self.port}" if host == "default" else host)
+        for k, v in (headers or {}).items():
+            c.putheader(k, v)
+        c.putheader("Content-Length", "2")
+        c.endheaders(b"{}")
+        r = c.getresponse()
+        body = r.read()
+        c.close()
+        return r.status, body
+
+    def test_good_requests_pass(self):
+        self.assertEqual(self.req("GET", "/api/updates")[0], 200)
+        good = {"X-Switchboard": "1"}
+        self.assertEqual(self.req("POST", "/api/updates/apply/nope", good)[0], 404)
+        for host in (f"localhost:{self.port}", f"[::1]:{self.port}"):
+            self.assertEqual(self.req("GET", "/api/updates", host=host)[0], 200)
+        origin = {"X-Switchboard": "1", "Origin": f"http://127.0.0.1:{self.port}"}
+        self.assertEqual(self.req("POST", "/api/updates/apply/nope", origin)[0], 404)
+
+    def test_bad_host_is_refused_for_get_and_post(self):
+        for host in ("evil.example.com", f"evil.example.com:{self.port}", "127.0.0.1:1", ""):
+            self.assertEqual(self.req("GET", "/api/updates", host=host)[0], 403, host)
+            self.assertEqual(self.req("POST", "/api/updates/apply/nope", {"X-Switchboard": "1"}, host=host)[0], 403, host)
+
+    def test_bad_origin_is_refused(self):
+        for origin in ("http://evil.example.com", "null", f"http://localhost:{self.port}", f"https://127.0.0.1:{self.port}"):
+            code, _ = self.req("POST", "/api/updates/apply/nope", {"X-Switchboard": "1", "Origin": origin})
+            self.assertEqual(code, 403, origin)
+            self.assertEqual(self.req("GET", "/api/updates", {"Origin": origin})[0], 403, origin)
+
+    def test_post_without_the_header_is_refused_on_every_endpoint(self):
+        for path in ("/api/updates/check", "/api/updates/apply/pip", "/api/start/x", "/api/stop/x",
+                     "/api/stop-all", "/api/unload", "/api/chat"):
+            self.assertEqual(self.req("POST", path)[0], 403, path)
+        self.assertEqual(self.req("POST", "/api/updates/check", {"X-Switchboard": "0"})[0], 403)
+
+    def test_the_page_sends_the_header_on_every_post(self):
+        html = (Path(__file__).resolve().parent.parent / "static" / "index.html").read_text()
+        self.assertEqual(html.count('method: "POST"'), html.count("X-Switchboard"))
+        self.assertGreaterEqual(html.count("X-Switchboard"), 3)
 
 
 if __name__ == "__main__":

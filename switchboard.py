@@ -521,7 +521,34 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _allowed_hosts(self):
+        host, port = self.server.server_address[:2]
+        names = {"127.0.0.1", "localhost", "[::1]", str(host)}
+        if ":" in str(host) and not str(host).startswith("["):
+            names.add(f"[{host}]")
+        return {f"{n}:{port}".lower() for n in names}
+
+    def _guard(self, post):
+        """Refuse requests that do not come from this page on this machine: a wrong Host
+        (DNS rebinding), a foreign Origin (another website), or a POST without our header
+        (which a cross-site form cannot send). Returns True if the request may go on."""
+        host = (self.headers.get("Host") or "").strip().lower()
+        origin = self.headers.get("Origin")
+        why = None
+        if host not in self._allowed_hosts():
+            why = "bad Host header"
+        elif origin is not None and origin.strip().lower() != "http://" + host:
+            why = "bad Origin header"
+        elif post and self.headers.get("X-Switchboard") != "1":
+            why = "missing X-Switchboard header"
+        if why:
+            self._json(403, {"error": "forbidden: " + why})
+            return False
+        return True
+
     def do_GET(self):
+        if not self._guard(False):
+            return
         path, _, query = self.path.partition("?")
         q = dict(p.split("=", 1) for p in query.split("&") if "=" in p)
         if path in ("/", "/index.html"):
@@ -545,6 +572,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(404, {"error": "not found"})
 
     def do_POST(self):
+        if not self._guard(True):
+            return
         length = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(length) if length else b""
         if self.path.startswith("/api/start/"):
@@ -554,8 +583,8 @@ class Handler(BaseHTTPRequestHandler):
             code, obj = api_stop(self.path.rsplit("/", 1)[1])
             return self._json(code, obj)
         if self.path == "/api/updates/check":
-            get_updater().check_all_async()
-            return self._json(202, {"ok": True})
+            code, obj = get_updater().check_all_async()
+            return self._json(code, obj)
         if self.path.startswith("/api/updates/apply/"):
             code, obj = api_updates_apply(self.path.rsplit("/", 1)[1])
             return self._json(code, obj)
@@ -615,7 +644,7 @@ def main():
     load_config(a.config)
     port = a.port or CONFIG.get("port", 8090)
     threading.Thread(target=sampler, daemon=True).start()
-    get_updater().check_all_async()  # read-only checks, one at a time, in the background
+    get_updater().check_all_async(startup=True)  # read-only checks, one at a time, in the background
     srv = ThreadingHTTPServer((a.host, port), Handler)
     srv.daemon_threads = True
     print(f"Switchboard on http://{a.host}:{port}  (config: {a.config})")
