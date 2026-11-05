@@ -114,12 +114,37 @@
 
   #logbox { flex: 1; margin: 0; padding: 14px 16px; overflow: auto; font: 12.5px/1.5 var(--mono); color: #b9ccd4; white-space: pre-wrap; overflow-wrap: anywhere; min-height: 240px; max-height: 52vh; }
   #toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); background: #2a1a1d; border: 1px solid var(--bad); color: #ffd6d9; padding: 9px 14px; border-radius: 8px; display: none; max-width: 90vw; }
+
+  /* updates */
+  .btn .badge { display: inline-block; min-width: 18px; padding: 0 5px; margin-left: 6px; border-radius: 9px; background: var(--warm); color: #14181b; font-size: 12px; font-weight: 650; text-align: center; line-height: 18px; }
+  .btn .badge[hidden] { display: none; }
+  #updOverlay { position: fixed; inset: 0; background: rgba(5,9,12,.62); display: none; align-items: flex-start; justify-content: center; padding: 8vh 16px 16px; z-index: 20; }
+  #updOverlay.on { display: flex; }
+  #updPanel { width: min(720px, 100%); max-height: 80vh; display: flex; flex-direction: column; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
+  #updPanel .uhead { display: flex; align-items: center; gap: 8px; padding: 12px 16px; border-bottom: 1px solid var(--line); }
+  #updPanel .uhead h2 { flex: 1; font-size: 15px; color: var(--text); }
+  #updNote { padding: 8px 16px; font-size: 13px; color: var(--muted); border-bottom: 1px solid var(--line); }
+  #updNote:empty { display: none; }
+  #updList { overflow-y: auto; }
+  .urow { display: grid; grid-template-columns: 1fr auto; gap: 4px 12px; padding: 12px 16px; border-top: 1px solid var(--line); }
+  .urow:first-child { border-top: 0; }
+  .urow .un { font-weight: 560; }
+  .urow .ud, .urow .ut, .urow .ur { color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
+  .urow .ur { color: var(--warm); }
+  .urow pre { margin: 4px 0 0; font: 12px/1.45 var(--mono); color: #b9ccd4; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 220px; overflow: auto; }
+  .urow details summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+  .pill { display: inline-block; margin-left: 8px; padding: 0 8px; border-radius: 10px; font-size: 12px; font-weight: 500; border: 1px solid var(--line); color: var(--muted); }
+  .pill.avail { color: var(--warm); border-color: var(--warm); }
+  .pill.ok { color: var(--live); border-color: #2c7a6b; }
+  .pill.error { color: var(--bad); border-color: var(--bad); }
+  .urow .uact { grid-row: 1 / span 3; grid-column: 2; align-self: center; }
 </style>
 </head>
 <body>
 <header>
   <div class="brand">Switchboard</div>
   <div class="live-now" id="liveNow" aria-live="polite"><span class="meta">Nothing running</span></div>
+  <button class="btn" id="updatesBtn" aria-haspopup="dialog">Updates<span class="badge" id="updBadge" hidden>0</span></button>
   <button class="btn danger" id="stopAll">Stop all models</button>
 </header>
 
@@ -165,6 +190,18 @@
     </section>
   </div>
 </main>
+<div id="updOverlay">
+  <div id="updPanel" role="dialog" aria-modal="true" aria-labelledby="updTitle" tabindex="-1">
+    <div class="uhead">
+      <h2 id="updTitle">Updates</h2>
+      <button class="btn" id="updCheck">Check again</button>
+      <button class="btn primary" id="updAll">Update all</button>
+      <button class="btn" id="updClose" aria-label="Close">Close</button>
+    </div>
+    <div id="updNote" aria-live="polite"></div>
+    <div id="updList"></div>
+  </div>
+</div>
 <div id="toast" role="alert"></div>
 
 <script>
@@ -178,7 +215,7 @@ function toast(msg) {
   clearTimeout(toast.h); toast.h = setTimeout(() => t.style.display = "none", 6000);
 }
 async function post(url, body) {
-  const r = await fetch(url, {method: "POST", headers: {"Content-Type": "application/json"}, body: body ? JSON.stringify(body) : undefined});
+  const r = await fetch(url, {method: "POST", headers: {"Content-Type": "application/json", "X-Switchboard": "1"}, body: body ? JSON.stringify(body) : undefined});
   const j = await r.json().catch(() => ({}));
   if (!r.ok) toast(j.error || ("Request failed: " + r.status));
   return j;
@@ -388,7 +425,7 @@ async function send() {
   if (model && !loadedFor(model)) stat.textContent = "Loading " + shortId(model) + " into memory, the first reply can take a while";
   try {
     const payload = {messages: chatMsgs}; if (model) payload.model = model;
-    const r = await fetch("/api/chat", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(payload), signal: ctrl.signal});
+    const r = await fetch("/api/chat", {method: "POST", headers: {"Content-Type": "application/json", "X-Switchboard": "1"}, body: JSON.stringify(payload), signal: ctrl.signal});
     if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error(j.error || r.status); }
     const rd = r.body.getReader(), dec = new TextDecoder(); let buf = "";
     for (;;) {
@@ -417,6 +454,91 @@ $("#input").addEventListener("keydown", e => { if (e.key === "Enter" && !e.shift
 $("#input").addEventListener("input", e => { e.target.style.height = "auto"; e.target.style.height = Math.min(160, e.target.scrollHeight) + "px"; });
 $("#clearChat").onclick = () => { chatMsgs = []; $("#msgs").innerHTML = '<div class="empty" id="chatEmpty">New chat. Ask the running model something.</div>'; };
 $("#stopAll").onclick = async () => { if (confirm("Stop every model and tool that uses the GPUs? LiteLLM, Whisper, TTS and Open WebUI keep running.")) { await post("/api/stop-all"); poll(); } };
+
+
+/* ---------- updates ---------- */
+let upd = {checking: false, applying: null, items: []}, updOpen = false, updTimer = null, updBusyAll = false, updLast = null;
+const PILL = {"update available": "avail", "up to date": "ok", "error": "error"};
+function ago(t) { return t ? fmtDur(Date.now() / 1000 - t) + " ago" : "not checked yet"; }
+function renderUpdates() {
+  const n = upd.items.filter(i => i.status === "update available").length;
+  const bd = $("#updBadge"); bd.textContent = n; bd.hidden = n === 0;
+  $("#updatesBtn").title = n ? n + " update" + (n === 1 ? "" : "s") + " available" : "No updates available";
+  if (!updOpen) return;
+  $("#updCheck").disabled = upd.checking || !!upd.applying || updBusyAll;
+  $("#updAll").disabled = updBusyAll || upd.checking || !!upd.applying || !upd.items.some(i => i.can_apply);
+  $("#updNote").textContent = updLast || (upd.checking ? "Checking for updates. Nothing is changed by a check." : "");
+  const list = $("#updList"); list.textContent = "";
+  if (!upd.items.length) { const e = document.createElement("div"); e.className = "urow ud"; e.textContent = "No backend in backends.json has an \"update\" setting."; list.appendChild(e); }
+  for (const it of upd.items) {
+    const row = document.createElement("div"); row.className = "urow";
+    const t = document.createElement("div");
+    const nm = document.createElement("span"); nm.className = "un"; nm.textContent = it.name;
+    const pill = document.createElement("span"); pill.className = "pill " + (it.applying ? "" : PILL[it.status] || ""); pill.textContent = it.applying ? "updating" : it.status;
+    t.append(nm, pill);
+    const lines = String(it.detail || "").split("\n");
+    const d = document.createElement("div"); d.className = "ud";
+    d.textContent = it.applying && it.progress ? it.progress : lines[0];
+    const ck = document.createElement("div"); ck.className = "ut";
+    ck.textContent = "Checked " + ago(it.checked_at) + (it.running ? " · running now" : "");
+    row.append(t, d);
+    if (!it.applying && it.progress) { const p = document.createElement("div"); p.className = "ud"; p.textContent = it.progress; row.appendChild(p); }
+    if (!it.applying && lines.length > 1) {
+      const dt = document.createElement("details"); const sm = document.createElement("summary"); sm.textContent = "Output";
+      const pre = document.createElement("pre"); pre.textContent = it.detail; dt.append(sm, pre); row.appendChild(dt);
+    }
+    row.appendChild(ck);
+    if (it.reason) { const r = document.createElement("div"); r.className = "ur"; r.textContent = it.reason; row.appendChild(r); }
+    if (it.status === "update available" || it.can_apply || it.applying) {
+      const b = document.createElement("button"); b.className = "btn primary uact"; b.textContent = it.applying ? "Updating" : "Update";
+      b.disabled = !it.can_apply || updBusyAll || upd.checking; if (it.reason) b.title = it.reason;
+      b.onclick = async () => { await post("/api/updates/apply/" + encodeURIComponent(it.id)); pollUpdates(); };
+      row.appendChild(b);
+    }
+    list.appendChild(row);
+  }
+}
+async function pollUpdates() {
+  clearTimeout(updTimer);
+  let ok = true;
+  try { const r = await fetch("/api/updates"); if (!r.ok) throw new Error(r.status); upd = await r.json(); renderUpdates(); } catch { ok = false; }
+  updTimer = setTimeout(pollUpdates, (updOpen || upd.checking || upd.applying) ? 3000 : 60000);
+  return ok;
+}
+let updReturn = null;
+function openUpdates() { updOpen = true; updReturn = document.activeElement; $("#updOverlay").classList.add("on"); $("#updPanel").focus(); renderUpdates(); pollUpdates(); }
+function closeUpdates() { updOpen = false; $("#updOverlay").classList.remove("on"); if (updReturn) updReturn.focus(); pollUpdates(); }
+$("#updatesBtn").onclick = openUpdates;
+$("#updClose").onclick = closeUpdates;
+$("#updOverlay").addEventListener("mousedown", e => { if (e.target === $("#updOverlay")) closeUpdates(); });
+document.addEventListener("keydown", e => { if (e.key === "Escape" && updOpen) closeUpdates(); });
+$("#updCheck").onclick = async () => { updLast = null; await post("/api/updates/check"); upd.checking = true; renderUpdates(); pollUpdates(); };
+$("#updAll").onclick = async () => {
+  updBusyAll = true; updLast = "Updating..."; renderUpdates();
+  const done = [], skipped = [], failed = []; let lostContact = false;
+  const todo = upd.items.filter(i => i.status === "update available" || i.can_apply);
+  for (const it of todo) {
+    const cur = upd.items.find(x => x.id === it.id) || it;
+    if (cur.running && !cur.can_apply) { skipped.push(it.name + " (running)"); continue; }
+    const r = await fetch("/api/updates/apply/" + encodeURIComponent(it.id), {method: "POST", headers: {"X-Switchboard": "1"}});
+    if (!r.ok) { const j = await r.json().catch(() => ({})); skipped.push(it.name + (j.error ? " (" + j.error + ")" : "")); continue; }
+    let lost = false;
+    for (let bad = 0;;) {
+      await new Promise(res => setTimeout(res, 1500));
+      if (await pollUpdates()) bad = 0; else if (++bad >= 10) { lost = true; break; }
+      if (upd.applying !== it.id) break;
+      updLast = "Updating " + it.name + ": " + ((upd.items.find(x => x.id === it.id) || {}).progress || "");
+      renderUpdates();
+    }
+    if (lost) { lostContact = true; break; }
+    const after = upd.items.find(x => x.id === it.id);
+    (after && after.status === "error" ? failed : done).push(it.name);
+  }
+  updBusyAll = false;
+  updLast = lostContact ? "Lost contact with Switchboard. The update may still be running; reopen this panel to see where it stands." : [done.length ? "Updated: " + done.join(", ") + "." : "", failed.length ? "Failed: " + failed.join(", ") + "." : "", skipped.length ? "Skipped: " + skipped.join(", ") + "." : ""].filter(Boolean).join(" ") || "Nothing to update.";
+  renderUpdates(); pollUpdates();
+};
+pollUpdates();
 
 /* ---------- polling ---------- */
 async function poll() {
