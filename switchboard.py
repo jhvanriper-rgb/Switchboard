@@ -17,6 +17,8 @@ from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import updates
+
 HERE = Path(__file__).resolve().parent
 LOG_DIR = Path.home() / ".switchboard" / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -393,6 +395,34 @@ def read_logs(bid, n=200):
     return "\n".join(data.splitlines()[-n:])
 
 
+# ---------- updates ----------
+UPDATER = None
+
+
+def _update_running(bid):
+    return snapshot(bid)["phase"] in ("running", "starting", "stopping", "unresponsive")
+
+
+def _update_log(bid, text):
+    """Append an update's full output to the backend's log file (process backends only; the
+    others read journalctl or docker logs instead)."""
+    if BACKENDS.get(bid, {}).get("kind") == "process":
+        with open(LOG_DIR / f"{bid}.log", "a", encoding="utf-8") as f:
+            f.write("\n" + text)
+
+
+def get_updater():
+    global UPDATER
+    with lock:
+        if UPDATER is None:
+            UPDATER = updates.Updater(lambda: BACKENDS, _update_running, _update_log)
+        return UPDATER
+
+
+def api_updates_apply(bid):
+    return get_updater().apply(bid)
+
+
 # ---------- chat proxy ----------
 def live_chat_backend():
     for bid, b in BACKENDS.items():
@@ -507,6 +537,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, api_models())
         elif path == "/api/stats":
             self._json(200, {"history": list(HISTORY)[-int(q.get("n", 90)):]})
+        elif path == "/api/updates":
+            self._json(200, get_updater().snapshot())
         elif path == "/api/logs":
             self._json(200, {"log": read_logs(q.get("id", ""), int(q.get("n", 200)))})
         else:
@@ -520,6 +552,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(code, obj)
         if self.path.startswith("/api/stop/"):
             code, obj = api_stop(self.path.rsplit("/", 1)[1])
+            return self._json(code, obj)
+        if self.path == "/api/updates/check":
+            get_updater().check_all_async()
+            return self._json(202, {"ok": True})
+        if self.path.startswith("/api/updates/apply/"):
+            code, obj = api_updates_apply(self.path.rsplit("/", 1)[1])
             return self._json(code, obj)
         if self.path == "/api/stop-all":
             code, obj = api_stop_all()
@@ -577,6 +615,7 @@ def main():
     load_config(a.config)
     port = a.port or CONFIG.get("port", 8090)
     threading.Thread(target=sampler, daemon=True).start()
+    get_updater().check_all_async()  # read-only checks, one at a time, in the background
     srv = ThreadingHTTPServer((a.host, port), Handler)
     srv.daemon_threads = True
     print(f"Switchboard on http://{a.host}:{port}  (config: {a.config})")

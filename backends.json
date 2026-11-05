@@ -1,5 +1,5 @@
 {
-  "_note": "Entries whose command contains TODO show as 'not set up' and cannot be started. Group 'gpu' means only one such entry runs at a time (starting one stops the others). Any other group runs alongside anything and is left alone by 'Stop all models'. An entry with \"requires\": [ids] starts those first, and is stopped whenever one of them is stopped. Commands are split like a shell would (no pipes or &&); set \"shell\": true on an entry if you need those.",
+  "_note": "Entries whose command contains TODO show as 'not set up' and cannot be started. Group 'gpu' means only one such entry runs at a time (starting one stops the others). Any other group runs alongside anything and is left alone by 'Stop all models'. An entry with \"requires\": [ids] starts those first, and is stopped whenever one of them is stopped. Commands are split like a shell would (no pipes or &&); set \"shell\": true on an entry if you need those. An entry may carry an \"update\" object (see README); nothing is ever updated without a click on the Updates button.",
   "port": 8090,
   "backends": [
     {
@@ -13,7 +13,14 @@
       "port": 11434,
       "health": "http://127.0.0.1:11434/api/tags",
       "openai_base": "http://127.0.0.1:11434/v1",
-      "chat_model": "gemma4:31b-192k"
+      "chat_model": "gemma4:31b-192k",
+      "update": {
+        "kind": "github_release",
+        "repo": "ollama/ollama",
+        "version_command": "ollama --version",
+        "apply_command": "sh -c 'curl -fsSL https://ollama.com/install.sh | sh'",
+        "shell": true
+      }
     },
     {
       "id": "dsh",
@@ -39,7 +46,13 @@
       "health": "http://127.0.0.1:8888/health",
       "openai_base": "http://127.0.0.1:8888/v1",
       "chat_model": "default",
-      "slow_start": true
+      "slow_start": true,
+      "update": {
+        "kind": "git",
+        "path": "/home/james/llama.cpp",
+        "post_command": "cmake --build build --config Release -j 2 --target llama-server",
+        "post_cwd": "/home/james/llama.cpp"
+      }
     },
     {
       "id": "strata-flash-next",
@@ -56,6 +69,11 @@
       "slow_start": true,
       "env": {
         "STRATA_EXPERIMENTAL_SM60": "1"
+      },
+      "update": {
+        "kind": "git",
+        "path": "/home/james/Strata-main",
+        "python": "/home/james/Strata-main/.venv/bin/python"
       }
     },
     {
@@ -82,7 +100,12 @@
       "cwd": "/home/james/ComfyUI",
       "port": 8188,
       "health": "http://127.0.0.1:8188/system_stats",
-      "open_url": "http://127.0.0.1:8188"
+      "open_url": "http://127.0.0.1:8188",
+      "update": {
+        "kind": "git",
+        "path": "/home/james/ComfyUI",
+        "python": "/home/james/ComfyUI/venv/bin/python"
+      }
     },
     {
       "id": "litellm",
@@ -93,7 +116,12 @@
       "command": "litellm --config /home/james/litellm/config.yaml --port 4000",
       "cwd": "/home/james/litellm",
       "port": 4000,
-      "health": "http://127.0.0.1:4000/"
+      "health": "http://127.0.0.1:4000/",
+      "update": {
+        "kind": "pip",
+        "python": "python3",
+        "package": "litellm"
+      }
     },
     {
       "id": "whisper",
@@ -126,7 +154,11 @@
       "container": "open-webui",
       "port": 8080,
       "health": "http://127.0.0.1:8080/",
-      "open_url": "http://127.0.0.1:8080"
+      "open_url": "http://127.0.0.1:8080",
+      "update": {
+        "kind": "docker",
+        "image": "ghcr.io/open-webui/open-webui:main"
+      }
     }
   ]
 }
