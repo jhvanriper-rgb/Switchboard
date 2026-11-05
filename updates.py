@@ -14,6 +14,7 @@ import re
 import shlex
 import signal
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.request
@@ -73,18 +74,19 @@ def run_command(argv, cwd=None, timeout=CMD_TIMEOUT, shell=False, env=None):
     p = None
     try:
         full_env = {**os.environ, **(env or {})}
-        p = subprocess.Popen(argv, cwd=cwd, shell=shell, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                             text=True, stdin=subprocess.DEVNULL, env=full_env, start_new_session=True)
-        try:
-            out, _ = p.communicate(timeout=max(0.01, timeout))
-        except subprocess.TimeoutExpired:
-            _kill_group(p)
+        # Output goes to a temp file, not a pipe: a background process that outlives the
+        # command would otherwise hold a pipe open and look like a timeout. The result depends
+        # only on the command itself exiting.
+        with tempfile.TemporaryFile() as outf:
+            p = subprocess.Popen(argv, cwd=cwd, shell=shell, stdout=outf, stderr=subprocess.STDOUT,
+                                 stdin=subprocess.DEVNULL, env=full_env, start_new_session=True)
             try:
-                p.communicate(timeout=2)
-            except Exception:  # noqa: BLE001
-                pass
-            return 124, "command timed out"
-        return p.returncode, (out or "").strip()
+                p.wait(timeout=max(0.01, timeout))
+            except subprocess.TimeoutExpired:
+                _kill_group(p)
+                return 124, "command timed out"
+            outf.seek(0)
+            return p.returncode, outf.read().decode("utf-8", "replace").strip()
     except FileNotFoundError as e:
         return 127, f"command not found: {e.filename or e}"
     except Exception as e:  # noqa: BLE001 - must never escape
@@ -686,12 +688,12 @@ class Updater:
                 detail = f"Last update stopped at {inc['step']}: {inc['reason']}\nFix that, then click Update to run the steps again."
             self._store(bid, status, detail, meta=meta, steps=old.get("steps", []) if inc else [])
 
-    def check_all(self, startup=False):
-        """Check every entry one at a time (blocking). Returns False if a run was already going
-        or an update is running. At startup, entries with "check_at_startup": false are skipped."""
+    def _claim_check(self, startup):
+        """Under the lock: mark a check as running and return the ids to check, or None if a
+        check or an update is already going."""
         with self._lock:
             if self._checking or self._applying:
-                return False
+                return None
             self._checking = True
             todo = []
             for bid, b in self.entries().items():
@@ -701,22 +703,35 @@ class Updater:
                     continue
                 self._cache.setdefault(bid, {"status": CHECKING, "detail": "", "checked_at": None, "meta": {}, "steps": []})
                 todo.append(bid)
+            return todo
+
+    def _run_checks(self, todo):
         try:
             for bid in todo:
                 self._check_one(bid)
         finally:
             with self._lock:
                 self._checking = False
+
+    def check_all(self, startup=False):
+        """Check every entry one at a time (blocking). Returns False if a run was already going
+        or an update is running. At startup, entries with "check_at_startup": false are skipped."""
+        todo = self._claim_check(startup)
+        if todo is None:
+            return False
+        self._run_checks(todo)
         return True
 
     def check_all_async(self, startup=False):
-        """Start a background check. Returns (code, body)."""
+        """Start a background check. Returns (code, body). The check is claimed under the lock
+        before this returns, so an update cannot slip in between."""
         with self._lock:
             if self._applying:
                 return 409, {"error": "An update is running. Check again when it finishes."}
             if self._checking:
                 return 202, {"ok": True}
-        threading.Thread(target=self.check_all, kwargs={"startup": startup}, daemon=True).start()
+            todo = self._claim_check(startup)
+            threading.Thread(target=self._run_checks, args=(todo,), daemon=True).start()
         return 202, {"ok": True}
 
     # -- applying

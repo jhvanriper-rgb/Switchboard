@@ -519,6 +519,28 @@ class RealProcessGroup(unittest.TestCase):
                 time.sleep(0.1)
             self.assertFalse(alive(pid), "the background child survived the timeout")
 
+    def test_leader_exiting_normally_is_not_a_timeout_even_if_a_child_keeps_running(self):
+        import tempfile
+        import time
+        with tempfile.TemporaryDirectory() as d:
+            pidfile = Path(d) / "pid"
+            t0 = time.monotonic()
+            rc, out = up.run_command(["sh", "-c", f"sleep 38 & echo $! > {pidfile}; echo started; exit 0"], timeout=10)
+            took = time.monotonic() - t0
+            pid = int(pidfile.read_text())
+            try:
+                self.assertEqual(rc, 0)
+                self.assertEqual(out, "started")
+                self.assertLess(took, 5)
+                self.assertTrue(alive(pid), "the group must not be killed when the leader exits normally")
+            finally:
+                import os
+                import signal
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+
     def test_normal_command_returns_output(self):
         rc, out = up.run_command(["sh", "-c", "echo hi; echo err 1>&2; exit 3"])
         self.assertEqual(rc, 3)
@@ -545,8 +567,13 @@ class RealGit(unittest.TestCase):
                     "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com",
                     "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}
         import os
+        from unittest import mock
         self._sub = subprocess
-        self.environ = {**os.environ, **self.env}
+        hermetic = {"GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null", "GIT_TERMINAL_PROMPT": "0"}
+        patcher = mock.patch.dict(os.environ, {**self.env, **hermetic})
+        patcher.start()  # also applies to the git commands updates.py runs
+        self.addCleanup(patcher.stop)
+        self.environ = dict(os.environ)
         self.remote = self.dir / "remote.git"
         self.g(self.dir, "init", "-q", "--bare", str(self.remote))
         self.g(self.dir, "symbolic-ref", "HEAD", "refs/heads/main", cwd_git=self.remote)
@@ -633,6 +660,22 @@ class RealGit(unittest.TestCase):
 
 
 class SafetyRules(Patched):
+    def test_async_check_is_claimed_before_it_returns(self):
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+
+        def blocked(argv, **kw):
+            gate.wait(5)
+            return 0, ""
+        self.patch(blocked, lambda url: {"tag_name": "1.0.0"})
+        u = self.make()
+        u._store("git", up.AVAILABLE, "x")
+        self.assertEqual(u.check_all_async()[0], 202)
+        self.assertTrue(u._checking)  # claimed under the lock, before the thread got going
+        code, obj = u.apply("git", background=False)
+        self.assertEqual((code, obj["error"]), (409, "A check is running, try again in a moment."))
+        gate.set()
+
     def make(self, **kw):
         return up.Updater(lambda: backends(), kw.get("is_running", lambda bid: False))
 
@@ -754,6 +797,12 @@ class RequestGuard(Patched):
             self.assertEqual(self.req("GET", "/api/updates", host=host)[0], 200)
         origin = {"X-Switchboard": "1", "Origin": f"http://127.0.0.1:{self.port}"}
         self.assertEqual(self.req("POST", "/api/updates/apply/nope", origin)[0], 404)
+
+    def test_query_string_is_stripped_and_ids_are_unquoted(self):
+        good = {"X-Switchboard": "1"}
+        self.assertEqual(self.req("POST", "/api/updates/apply/nope?x=1", good)[0], 404)
+        self.assertEqual(self.req("POST", "/api/updates/apply/gi%74?x=1", good)[0], 409)  # found "git"
+        self.assertEqual(self.req("POST", "/api/start/nope%20x?y=2", good)[0], 404)
 
     def test_bad_host_is_refused_for_get_and_post(self):
         for host in ("evil.example.com", f"evil.example.com:{self.port}", "127.0.0.1:1", ""):

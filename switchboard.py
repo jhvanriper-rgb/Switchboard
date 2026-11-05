@@ -12,6 +12,7 @@ import subprocess
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -576,25 +577,29 @@ class Handler(BaseHTTPRequestHandler):
             return
         length = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(length) if length else b""
-        if self.path.startswith("/api/start/"):
-            code, obj = api_start(self.path.rsplit("/", 1)[1])
+        path = self.path.partition("?")[0]
+
+        def ident():
+            return urllib.parse.unquote(path.rsplit("/", 1)[1])
+        if path.startswith("/api/start/"):
+            code, obj = api_start(ident())
             return self._json(code, obj)
-        if self.path.startswith("/api/stop/"):
-            code, obj = api_stop(self.path.rsplit("/", 1)[1])
+        if path.startswith("/api/stop/"):
+            code, obj = api_stop(ident())
             return self._json(code, obj)
-        if self.path == "/api/updates/check":
+        if path == "/api/updates/check":
             code, obj = get_updater().check_all_async()
             return self._json(code, obj)
-        if self.path.startswith("/api/updates/apply/"):
-            code, obj = api_updates_apply(self.path.rsplit("/", 1)[1])
+        if path.startswith("/api/updates/apply/"):
+            code, obj = api_updates_apply(ident())
             return self._json(code, obj)
-        if self.path == "/api/stop-all":
+        if path == "/api/stop-all":
             code, obj = api_stop_all()
             return self._json(code, obj)
-        if self.path == "/api/unload":
+        if path == "/api/unload":
             code, obj = api_unload(raw)
             return self._json(code, obj)
-        if self.path == "/api/chat":
+        if path == "/api/chat":
             return self.chat(raw)
         self._json(404, {"error": "not found"})
 
