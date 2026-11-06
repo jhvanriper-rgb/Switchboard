@@ -531,6 +531,109 @@ def custom_steps(b, u):
     return out
 
 
+GPU_POLL_SECONDS = 2
+_sleep = time.sleep  # tests replace this
+
+
+def parse_gpu_check(u):
+    """(unit, wait_seconds, label) from the update object's "gpu_check", or None if absent.
+    Raises ValueError on a mistake in backends.json."""
+    gc = u.get("gpu_check")
+    if gc is None:
+        return None
+    if not isinstance(gc, dict) or not re.fullmatch(r"[\w@.:-]+", str(gc.get("unit", ""))):
+        raise ValueError('"gpu_check" needs a "unit", like {"unit": "ollama"}')
+    try:
+        wait = float(gc.get("wait", 60))
+    except (TypeError, ValueError) as e:
+        raise ValueError('"gpu_check" wait must be a number of seconds') from e
+    unit = str(gc["unit"])
+    return unit, max(0.0, wait), str(gc.get("name") or unit[:1].upper() + unit[1:])
+
+
+def journal_unreadable(rc, out):
+    return rc != 0 or "insufficient permissions" in (out or "") or "No journal files were opened" in (out or "")
+
+
+def gpu_lines(journal):
+    """The distinct 'inference compute' lines (one usable GPU each); a restart repeats them, so
+    lines with the same id= count once."""
+    seen, found = set(), []
+    for ln in (journal or "").splitlines():
+        if "inference compute" not in ln:
+            continue
+        m = re.search(r"\bid=(\S+)", ln)
+        key = m.group(1) if m else ln
+        if key not in seen:
+            seen.add(key)
+            found.append(ln.strip())
+    return found
+
+
+def nvidia_gpu_count():
+    """Number of GPUs `nvidia-smi -L` lists, or None when nvidia-smi is missing or fails."""
+    rc, out = run_command(["nvidia-smi", "-L"], timeout=CMD_TIMEOUT)
+    if rc != 0:
+        return None
+    return sum(1 for ln in out.splitlines() if ln.startswith("GPU "))
+
+
+def gpu_verify(gc, since):
+    """Check that the service sees every GPU after an update. Returns (ok, output, text)."""
+    unit, wait, label = gc
+    expected = nvidia_gpu_count()
+    attempts = int(wait // GPU_POLL_SECONDS) + 1
+    for i in range(attempts):
+        rc, journal = run_command(["journalctl", "-u", unit, "--since", since, "--no-pager"], timeout=CMD_TIMEOUT)
+        if journal_unreadable(rc, journal):
+            return False, journal, "could not read the service journal"
+        found = gpu_lines(journal)
+        need = max(1, expected or 0)
+        if len(found) >= need:
+            names = "\n".join(re.sub(r"^.*?(name=)", r"\1", ln) for ln in found)
+            return True, f"{label} sees {len(found)} GPU(s) (nvidia-smi lists {expected if expected is not None else 'unknown'}):\n{names}", \
+                f"{len(found)} GPU{'s' if len(found) != 1 else ''} found"
+        if i < attempts - 1:
+            _sleep(GPU_POLL_SECONDS)
+    skipped = [ln.strip() for ln in journal.splitlines() if "skipping CUDA device" in ln]
+    detail = f"{label} reported these GPUs since {since}:\n" + ("\n".join(re.sub(r"^.*?(name=)", r"\1", ln) for ln in found) or "(none)")
+    if skipped:
+        detail += "\nSkipped by " + label + ":\n" + "\n".join(skipped)
+    if expected is None:
+        reason = f"{label} reported no GPU after the update (waited {wait:g} s). The old version may need to be reinstalled."
+    else:
+        reason = f"{label} sees {len(found)} of {expected} GPUs after the update. The old version may need to be reinstalled."
+    return False, detail, reason
+
+
+def add_gpu_check(steps, u):
+    """If the update object has "gpu_check", remember the time just before the install step
+    (the installer restarts the service) and run the GPU check after the verify step passes."""
+    gc = parse_gpu_check(u)
+    if gc is None:
+        return steps
+    state = {}
+    target = next((s for s in steps if s.name == "install"), steps[0])
+    first_run = target.run
+
+    def stamped():
+        state["since"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        return first_run()
+    target.run = stamped
+    verify = steps[-1]
+    version_check = verify.run
+
+    def verify_with_gpus():
+        ok, out, text = version_check()
+        if not ok:
+            return ok, out, text
+        since = state.get("since") or time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - 600))
+        ok2, out2, text2 = gpu_verify(gc, since)
+        return ok2, f"{out}\n--- GPU check ---\n{out2}", text2
+    verify.run = verify_with_gpus
+    return steps
+
+
 def build_steps(b, meta):
     """Ordered steps for one entry. The last step is always a verify step."""
     u = b["update"]
@@ -542,8 +645,9 @@ def build_steps(b, meta):
         steps = custom_steps(b, u)
         if steps[-1].name != "verify":
             steps.append(defaults[-1])  # a custom update still has to prove it worked
-        return steps
-    return defaults
+    else:
+        steps = defaults
+    return add_gpu_check(steps, u)
 
 
 def run_steps(steps, progress=None):

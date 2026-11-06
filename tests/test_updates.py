@@ -261,6 +261,134 @@ class CheckBudget(Patched):
         self.assertEqual(row["detail"], "check timed out after 0.05 seconds. Raise check_timeout in backends.json.")
 
 
+def gpu_line(n, name):
+    return (f'Nov 05 12:00:0{n} host ollama[1]: time=2026-11-05T12:00:0{n} level=INFO source=types.go '
+            f'msg="inference compute" id=GPU-{n} library=CUDA compute=7.0 name=CUDA{n} description="{name}" total="16 GiB"')
+
+
+TWO = "\n".join(["Nov 05 12:00:00 host ollama[1]: Listening on 127.0.0.1:11434", gpu_line(0, "Tesla V100"), gpu_line(1, "GeForce RTX 3070")])
+ONE = "\n".join(["Nov 05 12:00:00 host ollama[1]: Listening on 127.0.0.1:11434", gpu_line(0, "Tesla V100"),
+                  'Nov 05 12:00:01 host ollama[1]: level=INFO msg="skipping CUDA device" id=GPU-1 reason="compute capability"'])
+SMI2 = "GPU 0: Tesla V100 (UUID: GPU-0)\nGPU 1: GeForce RTX 3070 (UUID: GPU-1)"
+GC = ("ollama", 60.0, "Ollama")
+
+
+class GpuCheck(Patched):
+    def setUp(self):
+        super().setUp()
+        self.sleeps = []
+        self._old_sleep = up._sleep
+        up._sleep = self.sleeps.append
+        self.addCleanup(setattr, up, "_sleep", self._old_sleep)
+
+    def test_both_gpus_found_passes(self):
+        fake = FakeRun([("journalctl", (0, TWO)), ("nvidia-smi", (0, SMI2))])
+        self.patch(fake)
+        ok, out, text = up.gpu_verify(GC, "2026-11-05 12:00:00")
+        self.assertTrue(ok)
+        self.assertEqual(text, "2 GPUs found")
+        self.assertIn("Tesla V100", out)
+        self.assertTrue(any("--since 2026-11-05 12:00:00" in c and "-u ollama" in c and "--no-pager" in c for c in fake.calls))
+        self.assertFalse(any("sudo" in c for c in fake.calls))
+
+    def test_a_missing_gpu_fails_with_a_clear_message_and_names_what_was_found(self):
+        self.patch(FakeRun([("journalctl", (0, ONE)), ("nvidia-smi", (0, SMI2))]))
+        ok, out, text = up.gpu_verify(("ollama", 0, "Ollama"), "2026-11-05 12:00:00")
+        self.assertFalse(ok)
+        self.assertEqual(text, "Ollama sees 1 of 2 GPUs after the update. The old version may need to be reinstalled.")
+        self.assertIn('description="Tesla V100"', out)
+        self.assertIn("skipping CUDA device", out)
+
+    def test_unreadable_journal_is_a_failure_not_a_pass(self):
+        for res in ((1, "journalctl: command not found"), (127, "command not found"),
+                    (0, "Hint: You are currently not seeing messages from other users and the system.\n"
+                        "No journal files were opened due to insufficient permissions.")):
+            self.patch(FakeRun([("journalctl", res), ("nvidia-smi", (0, SMI2))]))
+            ok, _, text = up.gpu_verify(GC, "2026-11-05 12:00:00")
+            self.assertFalse(ok)
+            self.assertEqual(text, "could not read the service journal")
+        self.assertEqual(self.sleeps, [])  # no point polling an unreadable journal
+
+    def test_no_nvidia_smi_still_needs_one_gpu_line(self):
+        self.patch(FakeRun([("journalctl", (0, ONE)), ("nvidia-smi", (127, "command not found"))]))
+        ok, _, text = up.gpu_verify(GC, "2026-11-05 12:00:00")
+        self.assertTrue(ok)
+        self.assertEqual(text, "1 GPU found")
+        self.patch(FakeRun([("journalctl", (0, "Nov 05 host ollama[1]: Listening")), ("nvidia-smi", (127, ""))]))
+        ok, _, text = up.gpu_verify(("ollama", 0, "Ollama"), "2026-11-05 12:00:00")
+        self.assertFalse(ok)
+        self.assertIn("no GPU", text)
+
+    def test_polling_waits_then_succeeds(self):
+        answers = ["Nov 05 host ollama[1]: starting", "Nov 05 host ollama[1]: starting", TWO]
+
+        def fake(argv, **kw):
+            if argv[0] == "nvidia-smi":
+                return 0, SMI2
+            return 0, answers.pop(0) if len(answers) > 1 else answers[0]
+        self.patch(fake)
+        ok, _, text = up.gpu_verify(GC, "2026-11-05 12:00:00")
+        self.assertTrue(ok)
+        self.assertEqual(len(self.sleeps), 2)
+
+    def test_timeout_fails_after_polling_for_the_whole_wait(self):
+        self.patch(FakeRun([("journalctl", (0, "Nov 05 host ollama[1]: starting")), ("nvidia-smi", (0, SMI2))]))
+        ok, _, text = up.gpu_verify(("ollama", 6.0, "Ollama"), "2026-11-05 12:00:00")
+        self.assertFalse(ok)
+        self.assertEqual(text, "Ollama sees 0 of 2 GPUs after the update. The old version may need to be reinstalled.")
+        self.assertEqual(len(self.sleeps), 3)  # 6 s wait, polled every 2 s
+
+    def test_a_restart_repeating_the_same_gpu_lines_counts_each_gpu_once(self):
+        self.patch(FakeRun([("journalctl", (0, TWO + "\n" + TWO)), ("nvidia-smi", (0, SMI2 + "\nGPU 2: x"))]))
+        ok, _, text = up.gpu_verify(("ollama", 0, "Ollama"), "2026-11-05 12:00:00")
+        self.assertFalse(ok)  # 2 distinct GPUs of 3
+
+    def test_pipeline_stamps_before_install_and_checks_after_the_version(self):
+        bk = backends()
+        bk["rel"]["update"]["gpu_check"] = {"unit": "ollama", "wait": 0}
+        fake = FakeRun([("tool --version", (0, "tool 0.5.2")), ("install-tool", (0, "installed")),
+                        ("journalctl", (0, TWO)), ("nvidia-smi", (0, SMI2))])
+        self.patch(fake)
+        ok, name, reason, out = up.run_steps(up.build_steps(bk["rel"], {"latest": (0, 5, 2)}))
+        self.assertTrue(ok, reason)
+        order = [c for c in fake.calls if "install-tool" in c or "tool --version" in c or "journalctl" in c]
+        self.assertTrue(order[0].endswith("install-tool"))
+        self.assertIn("tool --version", order[1])
+        self.assertIn("journalctl", order[2])
+        self.assertIn("GPU check", out)
+
+    def test_pipeline_fails_verify_when_a_gpu_is_missing(self):
+        bk = backends()
+        bk["rel"]["update"]["gpu_check"] = {"unit": "ollama", "wait": 0}
+        self.patch(FakeRun([("tool --version", (0, "tool 0.5.2")), ("install-tool", (0, "ok")),
+                            ("journalctl", (0, ONE)), ("nvidia-smi", (0, SMI2))]))
+        ok, name, reason, _ = up.run_steps(up.build_steps(bk["rel"], {"latest": (0, 5, 2)}))
+        self.assertEqual((ok, name), (False, "verify"))
+        self.assertIn("1 of 2 GPUs", reason)
+
+    def test_version_failure_skips_the_gpu_check(self):
+        bk = backends()
+        bk["rel"]["update"]["gpu_check"] = {"unit": "ollama"}
+        fake = FakeRun([("tool --version", (0, "tool 0.5.1")), ("install-tool", (0, "ok"))])
+        self.patch(fake)
+        ok, name, reason, _ = up.run_steps(up.build_steps(bk["rel"], {"latest": (0, 5, 2)}))
+        self.assertFalse(ok)
+        self.assertFalse(any("journalctl" in c for c in fake.calls))
+
+    def test_bad_gpu_check_settings_are_rejected(self):
+        for bad in ({}, {"unit": "a b; rm"}, "ollama", {"unit": "ollama", "wait": "soon"}):
+            bk = backends()
+            bk["rel"]["update"]["gpu_check"] = bad
+            with self.assertRaises(ValueError):
+                up.build_steps(bk["rel"], {})
+
+    def test_checked_in_ollama_entry_has_a_gpu_check(self):
+        cfg = json.loads((Path(__file__).resolve().parent.parent / "backends.json").read_text())
+        ollama = next(b for b in cfg["backends"] if b["id"] == "ollama")
+        self.assertEqual(ollama["update"]["gpu_check"], {"unit": "ollama"})
+        self.assertIsNone(up.parse_gpu_check({"kind": "git"}))
+
+
 class StepRunner(Patched):
     def steps(self, *specs):
         return [up.Step(n, lambda r=r: r) for n, r in specs]
@@ -753,6 +881,11 @@ class SafetyRules(Patched):
         code, obj = u.apply("git", background=False)
         self.assertEqual((code, obj["error"]), (409, "A check is running, try again in a moment."))
         gate.set()
+        for _ in range(200):  # let the background check finish so it cannot leak into the next test
+            if not u._checking:
+                break
+            threading.Event().wait(0.05)
+        self.assertFalse(u._checking)
 
     def make(self, **kw):
         return up.Updater(lambda: backends(), kw.get("is_running", lambda bid: False))

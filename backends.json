@@ -20,7 +20,8 @@
         "version_command": "ollama --version",
         "apply_command": "curl -fsSL https://ollama.com/install.sh | sh",
         "shell": true,
-        "update_while_running": true
+        "update_while_running": true,
+        "gpu_check": {"unit": "ollama"}
       }
     },
     {
