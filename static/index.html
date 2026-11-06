@@ -470,6 +470,10 @@ function renderUpdates() {
   $("#updNote").textContent = updLast || (upd.checking ? "Checking for updates. Nothing is changed by a check." : "");
   const list = $("#updList");
   const want = [];
+  const ids = new Set(upd.items.map(i => i.id));  // forget rows (and their Output state) that are gone
+  for (const id of Object.keys(updRows)) if (!ids.has(id)) delete updRows[id];
+  for (const id of [...openOut]) if (!ids.has(id)) openOut.delete(id);
+  for (const id of Object.keys(outState)) if (!ids.has(id)) delete outState[id];
   if (!upd.items.length) {
     if (!list.querySelector(".uempty")) { list.textContent = ""; const e = document.createElement("div"); e.className = "urow ud uempty"; e.textContent = "No backend in backends.json has an \"update\" setting."; list.appendChild(e); }
     return;
@@ -484,7 +488,6 @@ function renderUpdates() {
     r.ck.textContent = "Checked " + ago(it.checked_at) + (it.running ? " · running now" : "");  // the age moves on its own
     want.push(r.el);
   }
-  for (const id of Object.keys(updRows)) if (!upd.items.some(i => i.id === id)) delete updRows[id];
   // Put the rows in order without detaching ones that are already in place (detaching resets scroll).
   want.forEach((el, i) => { if (list.children[i] !== el) list.insertBefore(el, list.children[i] || null); });
   while (list.children.length > want.length) list.lastElementChild.remove();
