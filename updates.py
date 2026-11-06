@@ -9,6 +9,7 @@ All command execution goes through run_command() and all web lookups through fet
 so tests can replace those two functions.
 """
 import json
+import math
 import os
 import re
 import shlex
@@ -19,7 +20,9 @@ import threading
 import time
 import urllib.request
 
-CHECK_TIMEOUT = 60  # seconds per entry
+CHECK_TIMEOUT = 60  # seconds per entry (git, pip, github_release)
+DOCKER_CHECK_TIMEOUT = 1800  # docker pull of a multi-GB image is slow
+DOWNLOADING = "Downloading the image: this can take several minutes."
 CMD_TIMEOUT = 55  # seconds for one command inside a check
 APPLY_TIMEOUT = 3600
 POST_TIMEOUT = 7200
@@ -272,7 +275,7 @@ def check_github_release(u, meta=None):
     installed = parse_version(out) if rc == 0 else None
     dl = getattr(_ctx, "deadline", None)
     if dl is not None and dl - time.monotonic() <= 0:
-        return ERROR, "check timed out"
+        return ERROR, "check timed out"  # run_check rewrites this with the budget
     tag = fetch_json(f"https://api.github.com/repos/{repo}/releases/latest").get("tag_name", "")
     meta.update(installed=installed, latest=parse_version(tag))
     return decide_version(installed, parse_version(tag))
@@ -283,7 +286,8 @@ def check_docker(u, b, meta=None):
     image, container = u.get("image"), b.get("container")
     if not image or not container:
         return ERROR, 'docker update needs "image" and a "container" on the entry'
-    rc, out = _cmd(["docker", "pull", image])
+    rc, out = _cmd(["docker", "pull", image],
+                   timeout=max(APPLY_TIMEOUT, getattr(_ctx, "budget", None) or 0))  # the check's deadline is the real limit
     if rc != 0:
         return ERROR, "docker pull failed: " + tail_lines(out, 3)
     rc, new_id = _cmd(["docker", "image", "inspect", "--format", "{{.Id}}", image])
@@ -294,13 +298,39 @@ def check_docker(u, b, meta=None):
     return decide_image(meta["new_id"], cid.strip() if rc2 == 0 else "")
 
 
+MAX_CHECK_TIMEOUT = 86400
+
+
+def check_budget(b, override=None):
+    """Seconds one check of this entry may take: the update object's "check_timeout", else
+    `override` (tests), else 1800 for docker and 60 for everything else. Raises ValueError for
+    a check_timeout that is not a finite number above 0; values above a day are capped."""
+    u = b.get("update") or {}
+    if "check_timeout" in u:
+        v = u["check_timeout"]
+        try:
+            v = float(v) if not isinstance(v, bool) else float("nan")
+        except (TypeError, ValueError):
+            v = float("nan")
+        if not math.isfinite(v) or v <= 0:
+            raise ValueError('"check_timeout" in backends.json must be a number of seconds above 0')
+        return min(v, MAX_CHECK_TIMEOUT)
+    if override is not None:
+        return override
+    return DOCKER_CHECK_TIMEOUT if u.get("kind") == "docker" else CHECK_TIMEOUT
+
+
+def timed_out_text(budget):
+    return f"check timed out after {budget:g} seconds. Raise check_timeout in backends.json."
+
+
 def run_check(b, meta=None, budget=CHECK_TIMEOUT):
     """One entry's check, as (status, detail). Never raises. meta, if given, is filled with
     what the verify step needs (expected version, new image id). All of the check's commands
     share one deadline of `budget` seconds."""
     u = b.get("update")
     deadline = time.monotonic() + budget
-    _ctx.deadline = deadline
+    _ctx.deadline, _ctx.budget = deadline, budget
     try:
         kind = u.get("kind")
         if kind == "git":
@@ -316,9 +346,9 @@ def run_check(b, meta=None, budget=CHECK_TIMEOUT):
     except Exception as e:  # noqa: BLE001
         res = (ERROR, str(e)[:200] or type(e).__name__)
     finally:
-        _ctx.deadline = None
+        _ctx.deadline = _ctx.budget = None
     if res[0] == ERROR and time.monotonic() >= deadline:
-        return ERROR, "check timed out"
+        return ERROR, timed_out_text(budget)
     return res
 
 
@@ -510,6 +540,135 @@ def custom_steps(b, u):
     return out
 
 
+GPU_POLL_SECONDS = 2
+_sleep = time.sleep  # tests replace these two
+_clock = time.monotonic
+MAX_GPU_WAIT = 600
+JOURNAL_TIMEOUT = 10
+JOURNAL_READ_FAILED = "could not read the service journal"
+JOURNAL_NEEDS_GROUP = JOURNAL_READ_FAILED + " (add your user to the systemd-journal group)"
+
+
+def parse_gpu_check(u):
+    """(unit, wait_seconds, label) from the update object's "gpu_check", or None if absent.
+    Raises ValueError on a mistake in backends.json."""
+    gc = u.get("gpu_check")
+    if gc is None:
+        return None
+    if not isinstance(gc, dict) or not re.fullmatch(r"[\w@.:-]+", str(gc.get("unit", ""))):
+        raise ValueError('"gpu_check" needs a "unit", like {"unit": "ollama"}')
+    try:
+        w = gc.get("wait", 60)
+        wait = float(w) if not isinstance(w, bool) else float("nan")
+    except (TypeError, ValueError):
+        wait = float("nan")
+    if not math.isfinite(wait):
+        raise ValueError('"gpu_check" wait must be a number of seconds')
+    unit = str(gc["unit"])
+    return unit, min(max(0.0, wait), MAX_GPU_WAIT), str(gc.get("name") or unit[:1].upper() + unit[1:])
+
+
+def journal_unreadable(rc, out):
+    """Why the journal could not be read (a message), or None if it was read."""
+    out = out or ""
+    if "not seeing messages from other users" in out or "insufficient permissions" in out \
+            or "No journal files were opened" in out:
+        return JOURNAL_NEEDS_GROUP  # journalctl exits 0 here and prints "-- No entries --"
+    if rc != 0:
+        return JOURNAL_READ_FAILED
+    return None
+
+
+def gpu_lines(journal):
+    """The distinct 'inference compute' lines (one usable GPU each); a restart repeats them, so
+    lines with the same id= count once."""
+    seen, found = set(), []
+    for ln in (journal or "").splitlines():
+        if "inference compute" not in ln:
+            continue
+        m = re.search(r"\bid=(\S+)", ln)
+        key = m.group(1) if m else ln
+        if key not in seen:
+            seen.add(key)
+            found.append(ln.strip())
+    return found
+
+
+def nvidia_gpu_count():
+    """Number of GPUs `nvidia-smi -L` lists, or None when nvidia-smi is missing or fails."""
+    rc, out = run_command(["nvidia-smi", "-L"], timeout=CMD_TIMEOUT)
+    if rc != 0:
+        return None
+    return sum(1 for ln in out.splitlines() if ln.startswith("GPU "))
+
+
+def gpu_verify(gc, since):
+    """Check that the service is up and sees every GPU after an update. Polls against one
+    deadline of `wait` seconds. Returns (ok, output, text)."""
+    unit, wait, label = gc
+    expected = nvidia_gpu_count()
+    deadline = _clock() + wait
+    journal, found, active = "", [], True
+    while True:
+        rc, state = run_command(["systemctl", "is-active", unit], timeout=JOURNAL_TIMEOUT)
+        active = state.strip() == "active"
+        if active:
+            rc, journal = run_command(["journalctl", "-u", unit, "--since", since, "--no-pager"],
+                                      timeout=JOURNAL_TIMEOUT)
+            why = journal_unreadable(rc, journal)
+            if why:
+                return False, journal, why
+            found = gpu_lines(journal)
+            need = max(1, expected or 0)
+            if len(found) >= need:
+                names = "\n".join(re.sub(r"^.*?(name=)", r"\1", ln) for ln in found)
+                return True, f"{label} sees {len(found)} GPU(s) (nvidia-smi lists {expected if expected is not None else 'unknown'}):\n{names}", \
+                    f"{len(found)} GPU{'s' if len(found) != 1 else ''} found"
+        left = deadline - _clock()
+        if left <= 0:
+            break
+        _sleep(min(GPU_POLL_SECONDS, left))
+    if not active:
+        return False, f"systemctl is-active {unit}: {state.strip() or '(no answer)'}", "service not running after the update"
+    skipped = [ln.strip() for ln in journal.splitlines() if "skipping CUDA device" in ln]
+    detail = f"{label} reported these GPUs since {since}:\n" + ("\n".join(re.sub(r"^.*?(name=)", r"\1", ln) for ln in found) or "(none)")
+    if skipped:
+        detail += "\nSkipped by " + label + ":\n" + "\n".join(skipped)
+    if expected is None:
+        reason = f"{label} reported no GPU after the update (waited {wait:g} s). The old version may need to be reinstalled."
+    else:
+        reason = f"{label} sees {len(found)} of {expected} GPUs after the update. The old version may need to be reinstalled."
+    return False, detail, reason
+
+
+def add_gpu_check(steps, u):
+    """If the update object has "gpu_check", remember the time just before the install step
+    (the installer restarts the service) and run the GPU check after the verify step passes."""
+    gc = parse_gpu_check(u)
+    if gc is None:
+        return steps
+    state = {}
+    target = next((s for s in steps if s.name == "install"), steps[0])
+    first_run = target.run
+
+    def stamped():
+        state["since"] = f"@{int(time.time())}"  # epoch form: no time zone to get wrong
+        return first_run()
+    target.run = stamped
+    verify = steps[-1]
+    version_check = verify.run
+
+    def verify_with_gpus():
+        ok, out, text = version_check()
+        if not ok:
+            return ok, out, text
+        since = state.get("since") or f"@{int(time.time()) - 600}"
+        ok2, out2, text2 = gpu_verify(gc, since)
+        return ok2, f"{out}\n--- GPU check ---\n{out2}", text2
+    verify.run = verify_with_gpus
+    return steps
+
+
 def build_steps(b, meta):
     """Ordered steps for one entry. The last step is always a verify step."""
     u = b["update"]
@@ -521,8 +680,9 @@ def build_steps(b, meta):
         steps = custom_steps(b, u)
         if steps[-1].name != "verify":
             steps.append(defaults[-1])  # a custom update still has to prove it worked
-        return steps
-    return defaults
+    else:
+        steps = defaults
+    return add_gpu_check(steps, u)
 
 
 def run_steps(steps, progress=None):
@@ -568,6 +728,7 @@ def precheck_apply(b):
     if not custom and kind in ("docker", "github_release") and not u.get("apply_command"):
         return RECREATE_MISSING if kind == "docker" else APPLY_MISSING
     try:
+        check_budget(b)
         build_steps(b, {})
     except (ValueError, KeyError) as e:
         return f"Bad update settings for {b['name']}: {e}"
@@ -575,7 +736,7 @@ def precheck_apply(b):
 
 
 # ---------- the cache and the background work ----------
-def _with_timeout(fn, seconds):
+def _with_timeout(fn, seconds, message="check timed out"):
     box = {}
 
     def work():
@@ -587,7 +748,7 @@ def _with_timeout(fn, seconds):
     t = threading.Thread(target=work, daemon=True)
     t.start()
     t.join(seconds)
-    return box.get("r") if "r" in box else (ERROR, "check timed out")
+    return box.get("r") if "r" in box else (ERROR, message)
 
 
 def progress_text(steps):
@@ -596,11 +757,11 @@ def progress_text(steps):
 
 
 class Updater:
-    def __init__(self, get_backends, is_running=lambda bid: False, log_writer=None, check_timeout=CHECK_TIMEOUT):
+    def __init__(self, get_backends, is_running=lambda bid: False, log_writer=None, check_timeout=None):
         self._get = get_backends
         self._is_running = is_running
         self._log = log_writer
-        self._timeout = check_timeout
+        self._timeout = check_timeout  # overrides the kind defaults (tests); None = use them
         self._lock = threading.RLock()
         self._cache = {}  # id -> status, detail, checked_at, meta, steps, incomplete
         self._checking = False
@@ -677,9 +838,24 @@ class Updater:
             if bid not in self._cache:
                 self._cache[bid] = {"status": CHECKING, "detail": "", "checked_at": None, "meta": {}, "steps": []}
         meta = {}
-        status, detail = _with_timeout(lambda: run_check(b, meta, self._timeout), self._timeout + 5)
+        try:
+            budget = check_budget(b, self._timeout)
+        except ValueError as e:
+            with self._lock:
+                if self._applying is None and self._epoch == epoch:
+                    self._store(bid, ERROR, f"Bad settings in backends.json: {e}")
+            return
+        with self._lock:
+            before = dict(self._cache.get(bid) or {})
+            if b["update"].get("kind") == "docker":  # the pull can take minutes: say so, not "error"
+                self._cache[bid] = {**before, "status": CHECKING, "detail": DOWNLOADING}
+        status, detail = _with_timeout(lambda: run_check(b, meta, budget), budget + 5, timed_out_text(budget))
         with self._lock:
             if self._applying is not None or self._epoch != epoch:
+                if before.get("checked_at") is None:  # never checked: do not leave a "checking" placeholder
+                    self._cache[bid] = {**before, "status": UNKNOWN, "detail": "not checked yet"}
+                else:
+                    self._cache[bid] = before
                 return  # an update ran meanwhile; this result may be stale
             old = self._cache.get(bid) or {}
             inc = old.get("incomplete")
@@ -780,7 +956,7 @@ class Updater:
                 inc = old.get("incomplete")
             try:
                 if not meta:
-                    run_check(b, meta, self._timeout)  # read-only; fills in what verify compares with
+                    run_check(b, meta, check_budget(b, self._timeout))  # read-only; fills in what verify compares with
                 steps = build_steps(b, meta)
             except Exception as e:  # noqa: BLE001
                 self._store(bid, ERROR, f"Could not start the update: {e}")
@@ -807,7 +983,8 @@ class Updater:
                                 incomplete={"step": name, "reason": reason})
                 return
             meta2 = {}
-            status, detail = _with_timeout(lambda: run_check(b, meta2, self._timeout), self._timeout + 5)
+            budget = check_budget(b, self._timeout)
+            status, detail = _with_timeout(lambda: run_check(b, meta2, budget), budget + 5, timed_out_text(budget))
             done = f"Updated and verified ({progress_text(prog)})."
             if status == ERROR:  # the update itself passed verify; only the recheck failed
                 status = UP_TO_DATE

@@ -468,35 +468,72 @@ function renderUpdates() {
   $("#updCheck").disabled = upd.checking || !!upd.applying || updBusyAll;
   $("#updAll").disabled = updBusyAll || upd.checking || !!upd.applying || !upd.items.some(i => i.can_apply);
   $("#updNote").textContent = updLast || (upd.checking ? "Checking for updates. Nothing is changed by a check." : "");
-  const list = $("#updList"); list.textContent = "";
-  if (!upd.items.length) { const e = document.createElement("div"); e.className = "urow ud"; e.textContent = "No backend in backends.json has an \"update\" setting."; list.appendChild(e); }
-  for (const it of upd.items) {
-    const row = document.createElement("div"); row.className = "urow";
-    const t = document.createElement("div");
-    const nm = document.createElement("span"); nm.className = "un"; nm.textContent = it.name;
-    const pill = document.createElement("span"); pill.className = "pill " + (it.applying ? "" : PILL[it.status] || ""); pill.textContent = it.applying ? "updating" : it.status;
-    t.append(nm, pill);
-    const lines = String(it.detail || "").split("\n");
-    const d = document.createElement("div"); d.className = "ud";
-    d.textContent = it.applying && it.progress ? it.progress : lines[0];
-    const ck = document.createElement("div"); ck.className = "ut";
-    ck.textContent = "Checked " + ago(it.checked_at) + (it.running ? " · running now" : "");
-    row.append(t, d);
-    if (!it.applying && it.progress) { const p = document.createElement("div"); p.className = "ud"; p.textContent = it.progress; row.appendChild(p); }
-    if (!it.applying && lines.length > 1) {
-      const dt = document.createElement("details"); const sm = document.createElement("summary"); sm.textContent = "Output";
-      const pre = document.createElement("pre"); pre.textContent = it.detail; dt.append(sm, pre); row.appendChild(dt);
-    }
-    row.appendChild(ck);
-    if (it.reason) { const r = document.createElement("div"); r.className = "ur"; r.textContent = it.reason; row.appendChild(r); }
-    if (it.status === "update available" || it.can_apply || it.applying) {
-      const b = document.createElement("button"); b.className = "btn primary uact"; b.textContent = it.applying ? "Updating" : "Update";
-      b.disabled = !it.can_apply || updBusyAll || upd.checking; if (it.reason) b.title = it.reason;
-      b.onclick = async () => { await post("/api/updates/apply/" + encodeURIComponent(it.id)); pollUpdates(); };
-      row.appendChild(b);
-    }
-    list.appendChild(row);
+  const list = $("#updList");
+  const want = [];
+  const ids = new Set(upd.items.map(i => i.id));  // forget rows (and their Output state) that are gone
+  for (const id of Object.keys(updRows)) if (!ids.has(id)) delete updRows[id];
+  for (const id of [...openOut]) if (!ids.has(id)) openOut.delete(id);
+  for (const id of Object.keys(outState)) if (!ids.has(id)) delete outState[id];
+  if (!upd.items.length) {
+    if (!list.querySelector(".uempty")) { list.textContent = ""; const e = document.createElement("div"); e.className = "urow ud uempty"; e.textContent = "No backend in backends.json has an \"update\" setting."; list.appendChild(e); }
+    return;
   }
+  list.querySelector(".uempty")?.remove();
+  const fresh = [];
+  for (const it of upd.items) {
+    // Rebuild a row only when its data changed; an untouched row keeps its open Output box and scroll position.
+    const sig = JSON.stringify([it.status, it.detail, it.running, it.can_apply, it.reason, it.applying, it.progress, it.checked_at, upd.checking, updBusyAll]);
+    let r = updRows[it.id];
+    if (!r || r.sig !== sig) { r = buildUpdRow(it); r.sig = sig; updRows[it.id] = r; fresh.push(r); }
+    r.ck.textContent = "Checked " + ago(it.checked_at) + (it.running ? " · running now" : "");  // the age moves on its own
+    want.push(r.el);
+  }
+  // Put the rows in order without detaching ones that are already in place (detaching resets scroll).
+  want.forEach((el, i) => { if (list.children[i] !== el) list.insertBefore(el, list.children[i] || null); });
+  while (list.children.length > want.length) list.lastElementChild.remove();
+  for (const r of fresh) if (r.pre && r.dt.open) restoreScroll(r.pre, r.id);
+}
+const updRows = {}, openOut = new Set(), outState = {};
+function restoreScroll(pre, id) {
+  const st = outState[id]; if (!st) return;
+  pre.scrollTop = st.stick ? pre.scrollHeight : st.top;
+}
+function buildUpdRow(it) {
+  const row = document.createElement("div"); row.className = "urow";
+  const t = document.createElement("div");
+  const nm = document.createElement("span"); nm.className = "un"; nm.textContent = it.name;
+  const pill = document.createElement("span"); pill.className = "pill " + (it.applying ? "" : PILL[it.status] || ""); pill.textContent = it.applying ? "updating" : it.status;
+  t.append(nm, pill);
+  const lines = String(it.detail || "").split("\n");
+  const d = document.createElement("div"); d.className = "ud";
+  d.textContent = it.applying && it.progress ? it.progress : lines[0];
+  const ck = document.createElement("div"); ck.className = "ut";
+  row.append(t, d);
+  if (!it.applying && it.progress) { const p = document.createElement("div"); p.className = "ud"; p.textContent = it.progress; row.appendChild(p); }
+  let dt = null, pre = null;
+  if (!it.applying && lines.length > 1) {
+    dt = document.createElement("details"); const sm = document.createElement("summary"); sm.textContent = "Output";
+    pre = document.createElement("pre"); pre.textContent = it.detail;  // text, never HTML
+    dt.append(sm, pre); row.appendChild(dt);
+    if (!outState[it.id]) outState[it.id] = {stick: it.status === "error", top: 0};
+    if (openOut.has(it.id)) dt.open = true;
+    dt.addEventListener("toggle", () => {
+      if (dt.open) { openOut.add(it.id); restoreScroll(pre, it.id); } else openOut.delete(it.id);
+    });
+    pre.addEventListener("scroll", () => {
+      const st = outState[it.id]; if (!st) return;
+      st.top = pre.scrollTop; st.stick = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 8;
+    });
+  }
+  row.appendChild(ck);
+  if (it.reason) { const r = document.createElement("div"); r.className = "ur"; r.textContent = it.reason; row.appendChild(r); }
+  if (it.status === "update available" || it.can_apply || it.applying) {
+    const b = document.createElement("button"); b.className = "btn primary uact"; b.textContent = it.applying ? "Updating" : "Update";
+    b.disabled = !it.can_apply || updBusyAll || upd.checking; if (it.reason) b.title = it.reason;
+    b.onclick = async () => { await post("/api/updates/apply/" + encodeURIComponent(it.id)); pollUpdates(); };
+    row.appendChild(b);
+  }
+  return {el: row, ck, dt, pre, id: it.id};
 }
 async function pollUpdates() {
   clearTimeout(updTimer);
