@@ -750,6 +750,135 @@ class LiveOutput(Patched):
         self.assertIn("output_at", html)
 
 
+class Thresholds(Patched):
+    def test_git_threshold_decisions(self):
+        self.assertEqual(up.decide_git(1, 50), (up.NEWER, "1 commit behind (below the 50 commit threshold)"))
+        self.assertEqual(up.decide_git(49, 50)[0], up.NEWER)
+        self.assertEqual(up.decide_git(50, 50), (up.AVAILABLE, "50 commits behind"))
+        self.assertEqual(up.decide_git(51, 50)[0], up.AVAILABLE)
+        self.assertEqual(up.decide_git(0, 50)[0], up.UP_TO_DATE)
+        self.assertEqual(up.decide_git(1)[0], up.AVAILABLE)  # default threshold is 1
+        self.assertEqual(up.decide_git(None, 50)[0], up.UNKNOWN)
+
+    def test_git_threshold_setting_must_be_a_whole_number_of_one_or_more(self):
+        self.assertEqual(up.git_threshold({}), 1)
+        self.assertEqual(up.git_threshold({"min_commits_behind": 20}), 20)
+        for bad in (0, -1, 1.5, "5", True, None, [3]):
+            with self.assertRaises(ValueError):
+                up.git_threshold({"min_commits_behind": bad})
+            b = backends()["git"]
+            b["update"]["min_commits_behind"] = bad
+            self.patch(FakeRun([("rev-parse --is-inside", (0, "true")), ("rev-list", (0, "9"))]))
+            status, detail = up.run_check(b)
+            self.assertEqual(status, up.ERROR)
+            self.assertIn("min_commits_behind", detail)
+
+    def test_release_threshold_decisions(self):
+        d = up.decide_release
+        self.assertEqual(d("ollama version is 0.40.14", "v0.40.15", "minor"),
+                         (up.NEWER, "0.40.14 to 0.40.15 (patch release, below the minor threshold)"))
+        self.assertEqual(d("0.40.14", "v0.41.0", "minor"), (up.AVAILABLE, "0.40.14 to 0.41.0"))
+        self.assertEqual(d("0.40.14", "0.41.0", "major")[0], up.NEWER)
+        self.assertEqual(d("0.40.14", "1.0.0", "major")[0], up.AVAILABLE)
+        self.assertEqual(d("0.40.14", "0.40.15")[0], up.AVAILABLE)  # default is patch
+        self.assertEqual(d("0.40.14", "0.40.15", "patch")[0], up.AVAILABLE)
+        self.assertEqual(d("0.40.15", "0.40.15", "minor")[0], up.UP_TO_DATE)
+        self.assertEqual(d("0.41.2", "0.40.15", "minor")[0], up.UP_TO_DATE)  # installed is newer
+        self.assertEqual(d("1.2", "1.2.1", "minor")[0], up.NEWER)  # a missing part counts as 0
+
+    def test_release_setting_must_be_patch_minor_or_major(self):
+        self.assertEqual(up.release_threshold({}), "patch")
+        with self.assertRaises(ValueError):
+            up.release_threshold({"min_release": "huge"})
+        b = backends()["rel"]
+        b["update"]["min_release"] = "huge"
+        self.patch(FakeRun([("tool --version", (0, "0.1.0"))]), lambda url: {"tag_name": "9.9.9"})
+        status, detail = up.run_check(b)
+        self.assertEqual(status, up.ERROR)
+        self.assertIn("min_release", detail)
+
+    def test_prereleases_are_never_offered_and_junk_is_ignored(self):
+        d = up.decide_release
+        self.assertEqual(d("0.40.14", "v0.40.15-rc1", "patch")[0], up.UP_TO_DATE)
+        self.assertEqual(d("0.40.14", "0.41.0-beta.2", "patch")[0], up.UP_TO_DATE)
+        self.assertEqual(d("0.40.14", "latest", "patch")[0], up.UNKNOWN)
+        self.assertEqual(d("0.40.14", "", "patch")[0], up.UNKNOWN)
+        self.assertEqual(d("no version here", "0.40.15", "patch")[0], up.UNKNOWN)
+        self.assertEqual(d("0.40.15+build7", "v0.40.15+build9", "patch")[0], up.UP_TO_DATE)  # build metadata ignored
+        # the final release is newer than its own release candidate
+        self.assertEqual(d("0.40.15-rc1", "0.40.15", "patch")[0], up.AVAILABLE)
+        self.assertEqual(up.parse_release("v0.40.15-rc1"), ((0, 40, 15), True))
+        self.assertEqual(up.parse_release("Warning: x\nclient version is 0.40.15"), ((0, 40, 15), False))
+
+    def test_check_end_to_end_for_both_kinds(self):
+        b = backends()["git"]
+        b["update"]["min_commits_behind"] = 50
+        self.patch(FakeRun([("rev-parse --is-inside", (0, "true")), ("rev-list", (0, "3"))]))
+        self.assertEqual(up.run_check(b), (up.NEWER, "3 commits behind (below the 50 commit threshold)"))
+        r = backends()["rel"]
+        r["update"]["min_release"] = "minor"
+        self.patch(FakeRun([("tool --version", (0, "tool version is 0.40.14"))]), lambda url: {"tag_name": "v0.40.15"})
+        status, detail = up.run_check(r)
+        self.assertEqual(status, up.NEWER)
+        self.assertIn("patch release, below the minor threshold", detail)
+
+    def test_pip_and_docker_have_no_threshold(self):
+        out = '[{"name": "my-pkg", "version": "1.0.0", "latest_version": "1.0.1"}]'
+        self.patch(FakeRun([("list --outdated", (0, out))]))
+        self.assertEqual(up.run_check(backends()["pip"])[0], up.AVAILABLE)
+
+    def test_a_row_below_the_threshold_can_still_be_updated(self):
+        fake = FakeRun()
+        self.patch(fake)
+        u = up.Updater(lambda: backends(), lambda bid: False)
+        u._store("git", up.NEWER, "1 commit behind (below the 50 commit threshold)")
+        row = next(i for i in u.snapshot()["items"] if i["id"] == "git")
+        self.assertTrue(row["can_apply"])
+        self.assertIsNone(row["reason"])
+        self.assertEqual(u.apply("git", background=False)[0], 202)
+        row = next(i for i in u.snapshot()["items"] if i["id"] == "git")
+        self.assertIn("pull ok", row["progress"])
+        self.assertIn("verify ok", row["progress"])  # same pipeline as any other update
+        # it is still refused while the backend runs
+        u2 = up.Updater(lambda: backends(), lambda bid: True)
+        u2._store("git", up.NEWER, "x")
+        self.assertEqual(u2.apply("git", background=False)[0], 409)
+
+    def test_badge_and_update_all_ignore_rows_below_the_threshold(self):
+        import shutil
+        import subprocess
+        if not shutil.which("node"):
+            self.skipTest("node not installed")
+        html = (Path(__file__).resolve().parent.parent / "static" / "index.html").read_text()
+        a = html.index('const NEWER = ')
+        b = html.index("\n", html.index("const updateAllTargets"))
+        src = html[a:b + 1]
+        script = src + """
+const items = [
+  {id: "a", status: "update available", can_apply: true},
+  {id: "b", status: "newer version exists", can_apply: true},
+  {id: "c", status: "up to date", can_apply: false},
+  {id: "d", status: "error", can_apply: true},   // unfinished update: still offered
+  {id: "e", status: "error", can_apply: false},
+  {id: "f", status: "update available", can_apply: false},
+];
+console.log(JSON.stringify({badge: badgeCount(items), all: updateAllTargets(items).map(i => i.id)}));
+"""
+        r = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=20)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(r.stdout), {"badge": 2, "all": ["a", "d", "f"]})
+
+    def test_checked_in_thresholds(self):
+        cfg = {b["id"]: b for b in json.loads((Path(__file__).resolve().parent.parent / "backends.json").read_text())["backends"]}
+        self.assertEqual(cfg["llamacpp-qwen"]["update"]["min_commits_behind"], 50)
+        self.assertEqual(cfg["strata-flash-next"]["update"]["min_commits_behind"], 50)
+        self.assertEqual(cfg["comfyui"]["update"]["min_commits_behind"], 20)
+        self.assertEqual(cfg["ollama"]["update"]["min_release"], "minor")
+        for bid in ("litellm", "open-webui"):
+            self.assertNotIn("min_commits_behind", cfg[bid]["update"])
+            self.assertNotIn("min_release", cfg[bid]["update"])
+
+
 class StepRunner(Patched):
     def steps(self, *specs):
         return [up.Step(n, lambda r=r: r) for n, r in specs]

@@ -30,6 +30,8 @@ Edit `backends.json`. Each entry has an `id`, `name`, `group`, and a `kind` of `
 
 Add an optional `update` object to any backend in `backends.json`. Backends without one do not appear in the Updates panel. Checks are read-only for the running software (`git fetch` and `docker pull` only download). Each check has a 60 second limit and shows "check timed out" if it hangs.
 
+Small gaps need not raise the badge, since an update can cost a long rebuild or a service restart. A `git` update object may set `"min_commits_behind"` (a whole number of 1 or more, default 1), and a `github_release` object may set `"min_release"` (`"patch"`, `"minor"` or `"major"`, default `"patch"`). Below the threshold the row shows the neutral status "newer version exists" with a detail such as "1 commit behind (below the 50 commit threshold)" or "0.40.14 to 0.40.15 (patch release, below the minor threshold)". Such a row does not count in the badge and is skipped by Update all, but its Update button works, so you can update anyway; the update steps are the same. A pre-release tag such as `0.40.15-rc1` is never offered, and `pip` and `docker` entries have no threshold. The checked-in file uses 50 commits for llama.cpp and Strata, 20 for ComfyUI, and `"minor"` for Ollama.
+
 Any update object may set `"check_timeout": <seconds>`, the most one check (all of its commands together) may take. The default is 60 for `git`, `pip` and `github_release`, and 1800 for `docker`. It must be a finite number above 0 and is capped at 86400; anything else shows a settings error in the row. A check that runs out reports "error: check timed out after N seconds. Raise check_timeout in backends.json."
 
 Kinds:

@@ -31,6 +31,7 @@ DETAIL_LINES = 40
 
 UP_TO_DATE = "up to date"
 AVAILABLE = "update available"
+NEWER = "newer version exists"  # newer, but below the entry's threshold: no badge, still updatable
 CHECKING = "checking"
 UNKNOWN = "unknown"
 NO_SOURCE = "no update source"
@@ -332,12 +333,77 @@ def tail_lines(text, n=DETAIL_LINES):
     return "\n".join((text or "").splitlines()[-n:])
 
 
-def decide_git(behind):
+def git_threshold(u):
+    """"min_commits_behind" of a git update object: a whole number of 1 or more (default 1).
+    Raises ValueError for anything else."""
+    v = u.get("min_commits_behind", 1)
+    if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+        raise ValueError('"min_commits_behind" in backends.json must be a whole number of 1 or more')
+    return v
+
+
+def decide_git(behind, min_behind=1):
     if behind is None:
         return UNKNOWN, "could not count commits behind"
+    text = f"{behind} commit{'s' if behind != 1 else ''} behind"
+    if behind >= min_behind and behind > 0:
+        return AVAILABLE, text
     if behind > 0:
-        return AVAILABLE, f"{behind} commit{'s' if behind != 1 else ''} behind"
+        return NEWER, f"{text} (below the {min_behind} commit threshold)"
     return UP_TO_DATE, "no new commits"
+
+
+RELEASE_LEVELS = {"patch": 0, "minor": 1, "major": 2}
+_RELEASE_RE = re.compile(r"v?(\d+(?:\.\d+)+)(-[0-9A-Za-z][0-9A-Za-z.-]*)?")
+
+
+def release_threshold(u):
+    """"min_release" of a github_release update object: patch, minor or major (default patch)."""
+    v = u.get("min_release", "patch")
+    if v not in RELEASE_LEVELS:
+        raise ValueError('"min_release" in backends.json must be "patch", "minor" or "major"')
+    return v
+
+
+def parse_release(text):
+    """(numbers, is_prerelease) for the first version in text, or None. A suffix such as -rc1
+    marks a pre-release; build metadata after + is ignored."""
+    m = _RELEASE_RE.search(text or "")
+    if not m:
+        return None
+    return tuple(int(x) for x in m.group(1).split(".")), bool(m.group(2))
+
+
+def release_class(old, new):
+    """Which part of the version changed: major, minor or patch (None if it cannot be told)."""
+    a, b = (tuple(old) + (0, 0, 0))[:3], (tuple(new) + (0, 0, 0))[:3]
+    if b[0] != a[0]:
+        return "major"
+    if b[1] != a[1]:
+        return "minor"
+    return "patch"
+
+
+def decide_release(installed_text, tag_text, min_release="patch"):
+    """Status for a GitHub release check. A pre-release tag is never offered; text that does not
+    parse is ignored; if the size of the jump cannot be told, the update is simply offered."""
+    lat = parse_release(tag_text)
+    if lat is None:
+        return UNKNOWN, "could not read the latest version"
+    if lat[1]:
+        return UP_TO_DATE, f"the latest release ({str(tag_text).strip()}) is a pre-release, which is not offered"
+    inst = parse_release(installed_text)
+    if inst is None:
+        return UNKNOWN, f"latest is {fmt_version(lat[0])}; installed version not readable"
+    pad = lambda v: (tuple(v[0]) + (0, 0, 0))[:max(3, len(v[0]))]  # noqa: E731
+    # a final release is newer than its own release candidates
+    if (pad(lat), 1) <= (pad(inst), 0 if inst[1] else 1):
+        return UP_TO_DATE, f"version {fmt_version(inst[0])}"
+    text = f"{fmt_version(inst[0])} to {fmt_version(lat[0])}"
+    cls = release_class(inst[0], lat[0])
+    if cls is None or RELEASE_LEVELS[cls] >= RELEASE_LEVELS[min_release]:
+        return AVAILABLE, text
+    return NEWER, f"{text} ({cls} release, below the {min_release} threshold)"
 
 
 def decide_version(installed, latest):
@@ -372,6 +438,10 @@ def _git(path, *args, **kw):
 
 
 def check_git(u):
+    try:
+        min_behind = git_threshold(u)
+    except ValueError as e:
+        return ERROR, f"Bad settings in backends.json: {e}"
     path = os.path.expanduser(u.get("path", ""))
     if not path or not os.path.isdir(path):
         return NO_SOURCE, "folder not found"
@@ -392,7 +462,7 @@ def check_git(u):
     rc, out = _git(path, "rev-list", "--count", f"HEAD..{upstream}")
     if rc != 0:
         return NO_SOURCE, "no upstream branch to compare with"
-    return decide_git(parse_behind(out))
+    return decide_git(parse_behind(out), min_behind)
 
 
 def check_pip(u, meta=None):
@@ -430,6 +500,10 @@ def check_github_release(u, meta=None):
     vc = u.get("version_command")
     if not vc:
         return ERROR, 'github_release needs "version_command"'
+    try:
+        min_release = release_threshold(u)
+    except ValueError as e:
+        return ERROR, f"Bad settings in backends.json: {e}"
     argv, sh = split_cmd(vc, bool(u.get("shell")))
     rc, out = _cmd(argv, shell=sh)
     installed = parse_version(out) if rc == 0 else None
@@ -438,7 +512,7 @@ def check_github_release(u, meta=None):
         return ERROR, "check timed out"  # run_check rewrites this with the budget
     tag = fetch_json(f"https://api.github.com/repos/{repo}/releases/latest").get("tag_name", "")
     meta.update(installed=installed, latest=parse_version(tag))
-    return decide_version(installed, parse_version(tag))
+    return decide_release(out if rc == 0 else "", tag, min_release)
 
 
 def check_docker(u, b, meta=None):
@@ -969,7 +1043,7 @@ class Updater:
 
     @staticmethod
     def _applicable(c):
-        return c["status"] == AVAILABLE or (c["status"] == ERROR and bool(c.get("incomplete")))
+        return c["status"] in (AVAILABLE, NEWER) or (c["status"] == ERROR and bool(c.get("incomplete")))
 
     # -- reading
     def snapshot(self):
