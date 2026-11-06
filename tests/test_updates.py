@@ -1643,8 +1643,9 @@ class GitTagsReal(GitRepoCase):
         for n in range(3):
             self.commit(self.app, f"past{n}.txt", "x")  # 3 commits past v0.39.2
         status, detail = up.check_git_tags({"kind": "git_tags", "path": str(self.app)})
-        self.assertEqual(status, up.UP_TO_DATE, detail)
-        self.assertIn("HEAD is past the newest release v0.39.3", detail)
+        self.assertEqual(status, up.UNKNOWN, detail)  # not "up to date": a real release exists
+        self.assertIn("HEAD is not behind v0.39.3", detail)
+        self.assertIn("update by hand", detail)
         # and the pull step refuses on its own, even if told to go there
         before = self.g(self.app, "rev-parse", "HEAD")
         ok, name, reason, _ = up.run_steps(up.build_steps(self.tags_b(), {"tag": "v0.39.3"}))
@@ -1778,11 +1779,64 @@ class GitTagsReal(GitRepoCase):
         self.assertEqual(row["status"], up.ERROR)
         self.assertIn("pull failed", row["detail"])
         self.assertIn("update by hand", row["detail"])
-        self.assertIn("changes files under an ignored path (models/configs/a.yaml)", row["detail"])
+        self.assertIn("changes files under an ignored path", row["detail"])
+        self.assertNotIn("Press Check again", row["detail"])
         self.assertIn("nothing was changed", row["detail"])
         self.assertFalse(row["can_apply"])  # nothing changed, so no unfinished update
         self.assertEqual(self.head_tags(), ["v0.39.3"])
         self.assertTrue((self.app / "models").is_symlink())  # the symlink survived
+
+    def test_the_check_reports_a_release_that_touches_an_ignored_path_as_by_hand(self):
+        self.models_release()
+        self.g(self.other, "pull", "-q", "origin", "main")
+        (self.other / "models" / "configs" / "a.yaml").write_text("a: 2")
+        self.g(self.other, "commit", "-q", "-am", "change a model config")
+        self.g(self.other, "push", "-q", "origin", "HEAD:main")
+        self.g(self.other, "tag", "v0.39.4")
+        self.g(self.other, "push", "-q", "origin", "v0.39.4")
+        status, detail = up.check_git_tags({"kind": "git_tags", "path": str(self.app), "ignore_dirty_paths": ["models/"]})
+        self.assertEqual(status, up.NEWER, detail)
+        self.assertIn("update by hand: it changes files under models/", detail)
+        status, _ = up.check_git_tags({"kind": "git_tags", "path": str(self.app)})
+        self.assertEqual(status, up.AVAILABLE)  # without the setting nothing is special
+
+    def test_a_file_moved_out_of_the_ignored_path_is_refused(self):
+        self.models_release()
+        self.g(self.other, "pull", "-q", "origin", "main")
+        self.g(self.other, "mv", "models/configs/a.yaml", "a_moved.yaml")
+        self.g(self.other, "commit", "-q", "-m", "move a config out of models")
+        self.g(self.other, "push", "-q", "origin", "HEAD:main")
+        self.g(self.other, "tag", "v0.39.4")
+        self.g(self.other, "push", "-q", "origin", "v0.39.4")
+        self.g(self.app, "fetch", "-q", "--tags", "origin")
+        self.assertTrue(up.touches_ignored(str(self.app), "v0.39.4", ["models"]))
+        self.assertFalse(up.touches_ignored(str(self.app), "v0.39.4", ["models2"]))
+        self.assertIsNone(up.touches_ignored(str(self.app), "v9.9.9", ["models"]))
+        self.symlink_models()
+        u, (code, obj) = self.apply_result(ignore_dirty_paths=["models/"])
+        row = u.snapshot()["items"][0]
+        self.assertEqual(row["status"], up.ERROR)
+        self.assertIn("update by hand", row["detail"])
+        self.assertTrue((self.app / "models").is_symlink())
+        self.assertEqual(self.head_tags(), ["v0.39.3"])
+
+    def test_local_commits_on_an_older_tag_are_not_up_to_date(self):
+        self.release_from_other("v0.39.3")
+        self.g(self.app, "checkout", "-q", "main")
+        self.commit(self.app, "mine.txt", "x")  # a local commit on top of v0.39.2, not on the way to v0.39.3
+        status, detail = up.check_git_tags({"kind": "git_tags", "path": str(self.app)})
+        self.assertEqual(status, up.UNKNOWN, detail)
+        self.assertIn("HEAD is not behind v0.39.3", detail)
+        self.assertIn("local commits or another branch", detail)
+        self.assertIn("update by hand", detail)
+
+    def test_head_that_really_descends_from_the_newest_release_is_up_to_date(self):
+        self.release_from_other("v0.39.3")
+        self.g(self.app, "fetch", "-q", "--tags", "origin")
+        self.g(self.app, "checkout", "-q", "-B", "main", "v0.39.3")
+        self.commit(self.app, "mine.txt", "x")
+        status, detail = up.check_git_tags({"kind": "git_tags", "path": str(self.app)})
+        self.assertEqual(status, up.UP_TO_DATE, detail)
 
     def test_the_check_text_mentions_local_changes_unless_they_are_ignored(self):
         self.models_release()
@@ -1881,15 +1935,25 @@ class GitTagsGuards(Patched):
         self.assertIn("checkout timed out", row["detail"])
         self.assertIn("only partly updated", row["detail"])
         self.assertNotIn("Nothing was changed", row["detail"])
+        self.assertIn("git checkout --detach v0.39.3", row["detail"])
         self.assertTrue(row["can_apply"])  # the unfinished-update marker is set
 
     def test_ignore_dirty_paths_validation(self):
         self.assertEqual(up.ignore_dirty_paths({}), [])
         self.assertEqual(up.ignore_dirty_paths({"ignore_dirty_paths": ["models/", "a/b"]}), ["models", "a/b"])
-        for bad in ("models/", [""], ["/"], ["/etc"], ["../x"], ["a/../b"], ["-x"], [3], [None], ["a\nb"], ["a\x00b"],
+        for bad in ("models/", [""], ["/"], ["/etc"], ["../x"], ["a/../b"], ["-x"], [3], [None], ["a\nb"], ["a\x00b"], ["./models"], ["a/./b"], ["."],
                     ["x" * 201], ["p%d" % n for n in range(51)], {"a": 1}, ["a\\b"]):
             with self.assertRaises(ValueError, msg=repr(bad)[:40]):
                 up.ignore_dirty_paths({"ignore_dirty_paths": bad})
+
+    def test_a_truncated_status_is_cannot_tell(self):
+        big = "x" * up.MAX_RESULT_BYTES
+        self.patch(FakeRun([("status --porcelain", (0, big))]))
+        rc, out, changes = up.blocking_changes("/x", ["models"])
+        self.assertEqual(rc, 125)
+        self.assertIn("too long to read in full", out)
+        b = {"id": "c", "name": "C", "kind": "process", "update": {"kind": "git_tags", "path": "/tmp"}}
+        self.assertIn("Could not read git status", up.precheck_apply(b))
 
     def test_status_parsing_handles_renames_and_odd_names(self):
         text = " D models/a\0R  new name.txt\0old.txt\0M  src/x.py\0"

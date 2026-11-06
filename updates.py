@@ -539,7 +539,7 @@ def ignore_dirty_paths(u):
     out = []
     for p in v:
         if (not isinstance(p, str) or not p.strip("/") or len(p) > MAX_IGNORE_CHARS or p.startswith(("/", "-"))
-                or any(ord(c) < 32 or ord(c) == 127 for c in p) or ".." in p.split("/") or "\\" in p):
+                or any(ord(c) < 32 or ord(c) == 127 for c in p) or ".." in p.split("/") or "." in p.split("/") or "\\" in p):
             raise ValueError(err)
         out.append(p.strip("/"))
     return out
@@ -578,7 +578,20 @@ def blocking_changes(path, ignored):
     rc, out = _git(path, "status", "--porcelain", "-z", "--untracked-files=no")
     if rc != 0:
         return rc, out, []
+    if len(out.encode("utf-8", "replace")) >= MAX_RESULT_BYTES:  # the runner keeps only the end of huge output
+        return 125, "the git status output is too long to read in full, so local changes cannot be ruled out", []
     return rc, out, [p for p in parse_status_z(out) if not all(under_ignored(x, ignored) for x in p)]
+
+
+def touches_ignored(path, tag, ignored):
+    """Does the move from HEAD to `tag` change anything under an ignored path? True, False, or
+    None when git cannot tell. Exact: literal pathspecs, no rename detection, no output."""
+    if not ignored:
+        return False
+    rc, _ = _cmd(["git", "-C", path, "-c", "core.quotePath=false", "diff", "--quiet", "--no-renames", "HEAD",
+                  f"refs/tags/{tag}", "--", *ignored],
+                 env={"GIT_TERMINAL_PROMPT": "0", "GIT_LITERAL_PATHSPECS": "1"})
+    return True if rc == 1 else False if rc == 0 else None
 
 
 def tag_fetch_args(remote):
@@ -669,8 +682,17 @@ def check_git_tags(u, meta=None):
             if not ok:
                 if is_error:
                     return UNKNOWN, reason
-                return UP_TO_DATE, f"HEAD is past the newest release {newest[0]} ({note})"
+                rc, _ = _git(path, "merge-base", "--is-ancestor", f"refs/tags/{newest[0]}^{{commit}}", "HEAD")
+                if rc == 0:  # HEAD really is a descendant of the newest release
+                    return UP_TO_DATE, f"HEAD is past the newest release {newest[0]} ({note})"
+                return UNKNOWN, f"HEAD is not behind {newest[0]} (local commits or another branch); update by hand ({note})"
         detail += f" ({note})"
+    if status in (AVAILABLE, NEWER) and ignored:
+        hit = touches_ignored(path, newest[0], ignored)
+        if hit is None:
+            return UNKNOWN, f"cannot tell whether {newest[0]} changes files under an ignored path; update by hand"
+        if hit:
+            return NEWER, f"{detail}; update by hand: it changes files under {', '.join(p + '/' for p in ignored)}"
     if status in (AVAILABLE, NEWER):
         rc, out, changes = blocking_changes(path, ignored)
         if rc == 0 and changes:
@@ -925,11 +947,10 @@ def git_tags_steps(b, u, meta):
         if ignored:
             # git would replace a symlink that stands where the release has tracked files, so a
             # release that touches an ignored path is not checked out at all
-            rc, names = _git(path, "diff", "--name-only", "-z", "HEAD", f"refs/tags/{t}")
-            hit = [n for n in names.split("\0") if n and under_ignored(n, ignored)] if rc == 0 else []
-            if rc != 0 or hit:
-                why = (f"the release {t} changes files under an ignored path ({hit[0]}); update by hand"
-                       if hit else f"could not compare {state['prev']} with {t}: {last_line(names)}")
+            hit = touches_ignored(path, t, ignored)
+            if hit is not False:
+                why = (f"the release {t} changes files under an ignored path; update by hand" if hit
+                       else f"cannot tell whether {t} changes files under an ignored path")
                 log.append(why)
                 return False, "\n".join(log), f"{why} (nothing was changed; {state['prev']} is still checked out)."
         args = ["-c", "advice.detachedHead=false", "checkout", "--detach", f"refs/tags/{t}"]
@@ -940,7 +961,8 @@ def git_tags_steps(b, u, meta):
             if rc == 124:  # timed out: git may have been part-way through writing files
                 pull_step.safe_on_fail = False
                 return False, "\n".join(log), (f"checkout timed out; the working tree may be only partly updated "
-                                               f"(it was on {state['prev']})")
+                                               f"(it was on {state['prev']}). To finish by hand, run "
+                                               f"`git checkout --detach {t}` in {path}")
             hint = ""
             if ignored and ("beyond a symbolic link" in out or any(p in out for p in ignored)):
                 hint = " The new release changes files under an ignored path; update by hand."
@@ -1580,7 +1602,8 @@ class Updater:
                 idx = next((i for i, s in enumerate(prog) if s["state"] == "failed"), 0)
                 safe = steps[idx].safe_on_fail if idx < len(steps) else False
                 if safe:  # nothing changed, so there is nothing half-done to finish later
-                    self._store(bid, ERROR, f"{name} failed: {reason}\nNothing was changed. Press Check again to retry.\n{tail}",
+                    again = "" if "update by hand" in reason else " Press Check again to retry."
+                    self._store(bid, ERROR, f"{name} failed: {reason}\nNothing was changed.{again}\n{tail}",
                                 steps=prog, incomplete=inc)
                 else:
                     marker = {"step": name, "reason": reason}
