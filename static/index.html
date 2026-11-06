@@ -458,15 +458,20 @@ $("#stopAll").onclick = async () => { if (confirm("Stop every model and tool tha
 
 /* ---------- updates ---------- */
 let upd = {checking: false, applying: null, items: []}, updOpen = false, updTimer = null, updBusyAll = false, updLast = null;
-const PILL = {"update available": "avail", "up to date": "ok", "error": "error"};
+const PILL = {"update available": "avail", "up to date": "ok", "error": "error"};  // "newer version exists" stays neutral
+const NEWER = "newer version exists";  // newer, but below the threshold in backends.json
+// Only real "update available" rows count for the badge.
+const badgeCount = items => items.filter(i => i.status === "update available").length;
+// "Update all" skips rows below their threshold; an unfinished update (error, can_apply) is still included.
+const updateAllTargets = items => items.filter(i => i.status === "update available" || (i.can_apply && i.status !== NEWER));
 function ago(t) { return t ? fmtDur(Date.now() / 1000 - t) + " ago" : "not checked yet"; }
 function renderUpdates() {
-  const n = upd.items.filter(i => i.status === "update available").length;
+  const n = badgeCount(upd.items);
   const bd = $("#updBadge"); bd.textContent = n; bd.hidden = n === 0;
   $("#updatesBtn").title = n ? n + " update" + (n === 1 ? "" : "s") + " available" : "No updates available";
   if (!updOpen) return;
   $("#updCheck").disabled = upd.checking || !!upd.applying || updBusyAll;
-  $("#updAll").disabled = updBusyAll || upd.checking || !!upd.applying || !upd.items.some(i => i.can_apply);
+  $("#updAll").disabled = updBusyAll || upd.checking || !!upd.applying || !updateAllTargets(upd.items).some(i => i.can_apply);
   $("#updNote").textContent = updLast || (upd.checking ? "Checking for updates. Nothing is changed by a check." : "");
   const list = $("#updList");
   const want = [];
@@ -568,7 +573,7 @@ $("#updCheck").onclick = async () => { updLast = null; await post("/api/updates/
 $("#updAll").onclick = async () => {
   updBusyAll = true; updLast = "Updating..."; renderUpdates();
   const done = [], skipped = [], failed = []; let lostContact = false;
-  const todo = upd.items.filter(i => i.status === "update available" || i.can_apply);
+  const todo = updateAllTargets(upd.items);
   for (const it of todo) {
     const cur = upd.items.find(x => x.id === it.id) || it;
     if (cur.running && !cur.can_apply) { skipped.push(it.name + " (running)"); continue; }

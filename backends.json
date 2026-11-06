@@ -21,7 +21,8 @@
         "apply_command": "curl -fsSL https://ollama.com/install.sh | sh",
         "shell": true,
         "update_while_running": true,
-        "gpu_check": {"unit": "ollama"}
+        "gpu_check": {"unit": "ollama"},
+        "min_release": "minor"
       }
     },
     {
@@ -53,7 +54,8 @@
         "kind": "git",
         "path": "/home/james/llama.cpp",
         "post_command": "cmake --build build --config Release -j 2 --target llama-server",
-        "post_cwd": "/home/james/llama.cpp"
+        "post_cwd": "/home/james/llama.cpp",
+        "min_commits_behind": 50
       }
     },
     {
@@ -75,7 +77,8 @@
       "update": {
         "kind": "git",
         "path": "/home/james/Strata-main",
-        "python": "/home/james/Strata-main/.venv/bin/python"
+        "python": "/home/james/Strata-main/.venv/bin/python",
+        "min_commits_behind": 50
       }
     },
     {
@@ -106,7 +109,8 @@
       "update": {
         "kind": "git",
         "path": "/home/james/ComfyUI",
-        "python": "/home/james/ComfyUI/venv/bin/python"
+        "python": "/home/james/ComfyUI/venv/bin/python",
+        "min_commits_behind": 20
       }
     },
     {
