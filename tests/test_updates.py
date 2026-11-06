@@ -517,6 +517,144 @@ class GpuCheck(Patched):
         self.assertIsNone(up.parse_gpu_check({"kind": "git"}))
 
 
+class LiveOutput(Patched):
+    def test_buffer_keeps_only_the_last_200_lines(self):
+        b = up.OutputBuffer()
+        b.feed("".join(f"line {n}\n" for n in range(1000)))
+        self.assertEqual(b.line_count(), 200)
+        self.assertEqual(b.tail().splitlines()[-1], "line 999")
+        self.assertEqual(len(b.tail().splitlines()), 60)  # the API tail
+        self.assertEqual(b.tail(500).splitlines()[0], "line 800")
+
+    def test_chunks_that_split_a_line_are_joined_and_carriage_returns_end_lines(self):
+        b = up.OutputBuffer()
+        b.feed("hel")
+        b.feed("lo\nprogress 10%\rprogress 20%\r")
+        b.feed("tail")
+        self.assertEqual(b.tail().splitlines(), ["hello", "progress 10%", "progress 20%", "tail"])
+        b.finish()
+        self.assertTrue(b.finished)
+        self.assertEqual(b.tail().splitlines()[-1], "tail")
+
+    def test_every_step_gets_a_marker_in_order(self):
+        b = up.OutputBuffer()
+        steps = [up.Step("pull", lambda: (True, "", "pulled")), up.Step("install", lambda: (True, "", "")),
+                 up.Step("verify", lambda: (False, "", "version mismatch"))]
+        up.run_steps(steps, out=b)
+        lines = b.tail().splitlines()
+        self.assertEqual(lines, ["== pull started ==", "== pull ok: pulled ==", "== install started ==",
+                                 "== install ok ==", "== verify started ==", "== verify failed: version mismatch =="])
+
+    def test_output_streams_while_the_command_is_still_running(self):
+        import time
+        b = up.OutputBuffer()
+        result = {}
+        step = up.cmd_step("install", ["sh", "-c", "echo first; sleep 2; echo second"], timeout=20)
+        th = threading.Thread(target=lambda: result.update(r=up.run_steps([step], out=b)))
+        th.start()
+        seen_early = False
+        for _ in range(30):
+            if "first" in b.tail() and th.is_alive():
+                seen_early = True
+                break
+            time.sleep(0.1)
+        th.join(20)
+        self.assertTrue(seen_early, "the first line should be visible before the command ends")
+        self.assertTrue(result["r"][0])
+        self.assertIn("second", b.tail())
+        self.assertEqual(result["r"][3].count("first"), 1)  # the final result is still complete
+
+    def test_timeout_still_kills_the_group_and_keeps_what_was_printed(self):
+        b = up.OutputBuffer()
+        up._ctx.sink = b
+        try:
+            rc, out = up.run_command(["sh", "-c", "echo hi; sleep 30 & sleep 30"], timeout=1)
+        finally:
+            up._ctx.sink = None
+        self.assertEqual((rc, out), (124, "command timed out"))
+        self.assertIn("hi", b.tail())
+
+    def test_hostile_output_is_capped_and_cleaned(self):
+        b = up.OutputBuffer()
+        b.feed("a" * 50000 + "\n")
+        b.feed("\x1b[31mred\x1b[0m \x00\x07bell\x1b]0;title\x07 ok\n")
+        b.feed("<script>alert(1)</script> <img src=x onerror=y>\n")
+        lines = b.tail().splitlines()
+        self.assertEqual(len(lines[0]), up.LIVE_LINE_CHARS)
+        self.assertEqual(lines[1], "red bell ok")
+        self.assertEqual(lines[2], "<script>alert(1)</script> <img src=x onerror=y>")  # kept as plain text
+        self.assertNotIn("\x1b", b.tail())
+        body = json.dumps({"output_tail": b.tail()})  # what the API sends: JSON-escaped text
+        self.assertEqual(json.loads(body)["output_tail"], b.tail())
+
+    def test_a_runaway_command_cannot_blow_up_memory(self):
+        b = up.OutputBuffer()
+        up._ctx.sink = b
+        try:
+            rc, out = up.run_command(["sh", "-c", "head -c 5000000 /dev/zero | tr '\\0' 'a'; echo done"], timeout=30)
+        finally:
+            up._ctx.sink = None
+        self.assertEqual(rc, 0)
+        self.assertLessEqual(len(out), up.MAX_RESULT_BYTES + 10)
+        self.assertLessEqual(b.line_count(), up.LIVE_LINES)
+        self.assertLessEqual(len(b.tail(1000)), up.LIVE_LINES * (up.LIVE_LINE_CHARS + 1))
+
+    def test_updater_exposes_the_tail_during_and_after_an_update_until_the_next_one(self):
+        gate, started = threading.Event(), threading.Event()
+        self.addCleanup(gate.set)
+
+        def fake(argv, **kw):
+            text = " ".join(argv)
+            if "install --upgrade" in text:
+                up.emit("Collecting pkg")  # what a streaming command would add
+                started.set()
+                gate.wait(5)
+                return 0, "ok"
+            if "pip show" in text:
+                return 0, "Version: 1.2.0"
+            return 0, "[]"
+        self.patch(fake)
+        bk = backends()
+        u = up.Updater(lambda: bk, lambda bid: False)
+        u._store("pip", up.AVAILABLE, "x", meta={"installed": (1, 0), "latest": (1, 2, 0)})
+        self.assertEqual(next(i for i in u.snapshot()["items"] if i["id"] == "pip")["output_tail"], "")
+        self.assertEqual(u.apply("pip")[0], 202)
+        self.assertTrue(started.wait(5))
+        row = next(i for i in u.snapshot()["items"] if i["id"] == "pip")
+        self.assertTrue(row["applying"])
+        self.assertIn("== pull started ==", row["output_tail"])
+        self.assertIn("Collecting pkg", row["output_tail"])
+        gate.set()
+        for _ in range(100):
+            if u.snapshot()["applying"] is None:
+                break
+            threading.Event().wait(0.05)
+        row = next(i for i in u.snapshot()["items"] if i["id"] == "pip")
+        self.assertFalse(row["applying"])
+        self.assertIn("== verify ok", row["output_tail"])
+        self.assertTrue(u._out["pip"].finished)
+        # the next update starts with a fresh buffer
+        u._store("pip", up.AVAILABLE, "x", meta={"installed": (1, 0), "latest": (1, 2, 0)})
+        gate.clear()
+        u.apply("pip")
+        self.assertFalse(u._out["pip"].finished)  # a fresh buffer, not the old finished one
+        gate.set()
+        for _ in range(100):
+            if u.snapshot()["applying"] is None:
+                break
+            threading.Event().wait(0.05)
+
+    def test_the_page_shows_output_as_text_and_polls_fast_while_updating(self):
+        html = (Path(__file__).resolve().parent.parent / "static" / "index.html").read_text()
+        a = html.index("function outText")
+        b = html.index("async function pollUpdates")
+        a2 = html.index("function buildUpdRow")
+        section = html[a:b] + html[a2:html.index("\n}\n", a2)]
+        self.assertNotIn("innerHTML", section)
+        self.assertIn("pre.textContent = text", section)
+        self.assertRegex(html, r"upd\.applying \? 1500 : \(updOpen \|\| upd\.checking\) \? 3000")
+
+
 class StepRunner(Patched):
     def steps(self, *specs):
         return [up.Step(n, lambda r=r: r) for n, r in specs]
@@ -821,7 +959,7 @@ class HttpApi(Patched):
             data = json.loads(r.read())
         self.assertEqual(set(data), {"checking", "applying", "items"})
         self.assertEqual({i["id"] for i in data["items"]}, {"git", "pip", "rel", "dock"})
-        for key in ("id", "name", "status", "detail", "checked_at", "running", "can_apply"):
+        for key in ("id", "name", "status", "detail", "checked_at", "running", "can_apply", "output_tail"):
             self.assertIn(key, data["items"][0])
 
 
