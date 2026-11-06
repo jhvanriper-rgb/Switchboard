@@ -37,7 +37,7 @@ UNKNOWN = "unknown"
 NO_SOURCE = "no update source"
 ERROR = "error"
 
-KINDS = ("git", "pip", "github_release", "docker")
+KINDS = ("git", "git_tags", "pip", "github_release", "docker")
 # A backend must be stopped before it is updated, unless its update object sets
 # "update_while_running": true (Ollama: its installer restarts the service itself).
 
@@ -487,6 +487,88 @@ def check_git(u):
     return decide_git(parse_behind(out), min_behind)
 
 
+# ---------- git_tags: a checkout that follows release tags (vMAJOR.MINOR.PATCH) ----------
+_STABLE_TAG_RE = re.compile(r"v(\d{1,9})\.(\d{1,9})\.(\d{1,9})")
+MAX_TAG_LINES = 50000  # more tag names than this are ignored (hostile or runaway output)
+MAX_TAG_CHARS = 64
+
+
+def newest_stable_tag(text):
+    """(tag, numbers) for the newest tag shaped exactly vMAJOR.MINOR.PATCH in `git tag --list`
+    output, or None. Tags with a suffix (-rc1) and tags that are not versions are ignored."""
+    best = None
+    for n, line in enumerate((text or "").splitlines()):
+        if n >= MAX_TAG_LINES:
+            break
+        tag = line.strip()
+        m = _STABLE_TAG_RE.fullmatch(tag) if len(tag) <= MAX_TAG_CHARS else None
+        if m:
+            nums = tuple(int(x) for x in m.groups())
+            if best is None or nums > best[1]:
+                best = (tag, nums)
+    return best
+
+
+def git_tags_remote(u):
+    """Optional "remote" name for the fetch; validated because it goes on a command line."""
+    v = u.get("remote")
+    if v is None:
+        return None
+    if not isinstance(v, str) or not re.fullmatch(r"[\w][\w.-]*", v):
+        raise ValueError('"remote" in backends.json must be a plain remote name such as "origin"')
+    return v
+
+
+def current_release(path):
+    """(tag, exact) for the checked-out version, or None. `exact` is True when HEAD is exactly on
+    a version tag (the newest one if several); otherwise the nearest version tag behind HEAD."""
+    rc, out = _git(path, "tag", "--points-at", "HEAD")
+    if rc == 0:
+        found = [(parse_release(ln.strip()), ln.strip()) for ln in out.splitlines()[:200]
+                 if len(ln.strip()) <= MAX_TAG_CHARS]
+        found = [(p[0], t) for p, t in found if p and re.fullmatch(r"v\d+(?:\.\d+)+(?:-[0-9A-Za-z.-]+)?", t)]
+        if found:
+            return max(found, key=lambda f: (not f[0][1], f[0][0]))[1], True  # a stable tag beats a release candidate
+    rc, out = _git(path, "describe", "--tags", "--abbrev=0", "--match", "v[0-9]*")
+    if rc == 0 and out.strip() and parse_release(out.strip()):
+        return out.strip().splitlines()[-1][:MAX_TAG_CHARS], False
+    return None
+
+
+def check_git_tags(u, meta=None):
+    meta = {} if meta is None else meta
+    try:
+        min_release = release_threshold(u)
+        remote = git_tags_remote(u)
+    except ValueError as e:
+        return ERROR, f"Bad settings in backends.json: {e}"
+    path = os.path.expanduser(u.get("path", ""))
+    if not path or not os.path.isdir(path):
+        return NO_SOURCE, "folder not found"
+    rc, out = _git(path, "rev-parse", "--is-inside-work-tree")
+    if rc != 0 or out.strip() != "true":
+        return NO_SOURCE, "not a git checkout"
+    rc, out = _git(path, "fetch", "--tags", "--quiet", *([remote] if remote else []))
+    if rc != 0:
+        return ERROR, "git fetch failed: " + tail_lines(out, 3)
+    rc, out = _git(path, "tag", "--list")
+    if rc != 0:
+        return ERROR, "could not list tags: " + tail_lines(out, 3)
+    newest = newest_stable_tag(out)
+    if newest is None:
+        return UNKNOWN, "no release tags like v1.2.3 found in this repository"
+    cur = current_release(path)
+    if cur is None:
+        return UNKNOWN, f"the checked-out commit is not on or after any release tag (newest release is {newest[0]})"
+    tag, exact = cur
+    meta.update(tag=newest[0], latest=newest[1], installed=(parse_release(tag) or ((),))[0])
+    status, detail = decide_release(tag, newest[0], min_release)
+    if not exact:
+        rc, desc = _git(path, "describe", "--tags", "--always")
+        detail += f" (HEAD is not exactly on a release tag: {last_line(desc) or tag})"
+    return status, detail
+
+
 def check_pip(u, meta=None):
     meta = {} if meta is None else meta
     py, pkg = u.get("python"), u.get("package")
@@ -596,6 +678,8 @@ def run_check(b, meta=None, budget=CHECK_TIMEOUT):
         kind = u.get("kind")
         if kind == "git":
             res = check_git(u)
+        elif kind == "git_tags":
+            res = check_git_tags(u, meta)
         elif kind == "pip":
             res = check_pip(u, meta)
         elif kind == "github_release":
@@ -686,6 +770,80 @@ def git_steps(b, u, meta):
     return steps
 
 
+def git_tags_steps(b, u, meta):
+    path = os.path.expanduser(u.get("path", ""))
+    remote = git_tags_remote(u)
+    state = {}
+
+    def tag():
+        t = meta.get("tag")
+        if not isinstance(t, str) or not _STABLE_TAG_RE.fullmatch(t):
+            raise ValueError("no release tag was chosen; press Check again first")
+        return t
+
+    def pull():
+        # fetch the tags again, then move to the chosen one. Nothing is reset or cleaned: git
+        # itself refuses to overwrite local changes, and the precheck already refuses a dirty tree.
+        try:
+            t = tag()
+        except ValueError as e:
+            return False, str(e), str(e)
+        rc, prev = _git(path, "describe", "--tags", "--always")
+        state["prev"] = last_line(prev) or "an unknown commit"
+        log = [f"previous checkout: {state['prev']}"]
+        for args in (["fetch", "--tags", "--quiet"] + ([remote] if remote else []),
+                     ["-c", "advice.detachedHead=false", "checkout", "--detach", f"refs/tags/{t}"]):
+            rc, out = run_command(["git", "-C", path, *args], env={"GIT_TERMINAL_PROMPT": "0"}, timeout=APPLY_TIMEOUT)
+            log.append("$ git " + " ".join(args) + "\n" + out)
+            ok, _, reason = cmd_result(rc, out, APPLY_TIMEOUT)
+            if not ok:
+                return False, "\n".join(log), f"{reason} (nothing was changed; {state['prev']} is still checked out)"
+        return True, "\n".join(log), f"now on {t}"
+
+    steps = [Step("pull", pull, safe_on_fail=True)]
+    parts = []
+    req = os.path.join(path, "requirements.txt")
+    if u.get("python") and os.path.isfile(req):
+        parts.append(([os.path.expanduser(u["python"]), "-m", "pip", "install", "-r", req], path, False, APPLY_TIMEOUT))
+    if u.get("post_command"):
+        argv, sh = split_cmd(u["post_command"], bool(u.get("post_shell")))
+        parts.append((argv, os.path.expanduser(u.get("post_cwd", path)), sh, POST_TIMEOUT))
+    if parts:
+        run_parts = _seq(parts)
+
+        def install():
+            ok, out, text = run_parts()
+            if not ok:
+                text += (f" (the new release {meta.get('tag')} is checked out; before the update it was "
+                         f"{state.get('prev', 'unknown')}; its dependencies may be only partly installed)")
+            return ok, out, text
+        steps.append(Step("install", install))
+    steps.append(Step("verify", lambda: verify_git_tags(path, u, meta)))
+    return steps
+
+
+def verify_git_tags(path, u, meta):
+    t = meta.get("tag")
+    if not isinstance(t, str) or not _STABLE_TAG_RE.fullmatch(t):
+        return False, "", "no release tag was chosen to verify against"
+    rc, head = _git(path, "rev-parse", "HEAD")
+    rc2, want = _git(path, "rev-parse", "--verify", "--quiet", f"refs/tags/{t}^{{commit}}")
+    if rc != 0 or rc2 != 0:
+        return False, head + "\n" + want, f"could not compare HEAD with {t}"
+    if head.strip() != want.strip():
+        return False, f"HEAD {head.strip()}\n{t} {want.strip()}", f"HEAD {head.strip()[:8]} is not on {t}"
+    rc3, points = _git(path, "tag", "--points-at", "HEAD")
+    out = f"HEAD is exactly on {t}\n{points}"
+    if u.get("verify_command"):
+        argv, sh = split_cmd(u["verify_command"], bool(u.get("verify_shell")))
+        rc4, o4 = run_command(argv, cwd=path, shell=sh, timeout=STEP_TIMEOUT)
+        ok, o4, reason = cmd_result(rc4, o4, STEP_TIMEOUT)
+        out += f"\n$ {u['verify_command']}\n{o4}"
+        if not ok:
+            return False, out, "verify command failed: " + reason
+    return True, out, f"on {t}"
+
+
 def verify_git(path, u):
     rc, head = _git(path, "rev-parse", "HEAD")
     rc2, up = _git(path, "rev-parse", git_upstream(u))
@@ -771,7 +929,7 @@ def docker_steps(b, u, meta):
     return steps
 
 
-_DEFAULT_STEPS = {"git": git_steps, "pip": pip_steps, "github_release": release_steps, "docker": docker_steps}
+_DEFAULT_STEPS = {"git": git_steps, "git_tags": git_tags_steps, "pip": pip_steps, "github_release": release_steps, "docker": docker_steps}
 
 
 def custom_steps(b, u):
@@ -994,13 +1152,21 @@ def precheck_apply(b):
     if kind not in _DEFAULT_STEPS:
         return f"unknown update kind {kind!r}"
     custom = u.get("steps") is not None or u.get("script")
-    if kind == "git":
+    if kind in ("git", "git_tags"):
         path = os.path.expanduser(u.get("path", ""))
         rc, out = _git(path, "status", "--porcelain", "--untracked-files=no")
         if rc != 0:
             return f"Could not read git status for {b['name']}: {tail_lines(out, 2)}"
         if out.strip():
             return f"{b['name']} has local changes in {path}. Commit or stash them first."
+    if kind == "git_tags":
+        # moving to a tag leaves the current commit behind; refuse if nothing else would keep it
+        path = os.path.expanduser(u.get("path", ""))
+        rc, out = _git(path, "for-each-ref", "--contains", "HEAD", "--count=1", "--format=%(refname)",
+                       "refs/heads", "refs/remotes", "refs/tags")
+        if rc == 0 and not out.strip():
+            return (f"{b['name']} is on a commit that is not on any branch or tag in {path}. "
+                    "Moving to a release would leave it behind. Create a branch for it first.")
     if not custom and kind in ("docker", "github_release") and not u.get("apply_command"):
         return RECREATE_MISSING if kind == "docker" else APPLY_MISSING
     try:

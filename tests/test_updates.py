@@ -927,7 +927,7 @@ console.log(JSON.stringify({badge: badgeCount(items), all: updateAllTargets(item
         cfg = {b["id"]: b for b in json.loads((Path(__file__).resolve().parent.parent / "backends.json").read_text())["backends"]}
         self.assertEqual(cfg["llamacpp-qwen"]["update"]["min_commits_behind"], 50)
         self.assertEqual(cfg["strata-flash-next"]["update"]["min_commits_behind"], 50)
-        self.assertEqual(cfg["comfyui"]["update"]["min_commits_behind"], 20)
+        self.assertEqual(cfg["comfyui"]["update"]["min_release"], "minor")  # follows release tags now, not commits
         self.assertEqual(cfg["ollama"]["update"]["min_release"], "minor")
         for bid in ("litellm", "open-webui"):
             self.assertNotIn("min_commits_behind", cfg[bid]["update"])
@@ -1303,7 +1303,7 @@ class RealProcessGroup(unittest.TestCase):
         self.assertEqual(rc, 127)
 
 
-class RealGit(unittest.TestCase):
+class GitRepoCase(unittest.TestCase):
     """Uses real git on repositories made in a temp dir. No network (the remote is a local path)."""
 
     def setUp(self):
@@ -1366,6 +1366,9 @@ class RealGit(unittest.TestCase):
     def snap(self, u):
         return u.snapshot()["items"][0]
 
+
+
+class RealGit(GitRepoCase):
     def test_clean_fast_forward_succeeds(self):
         self.publish_from_other()
         u = self.updater()
@@ -1408,6 +1411,245 @@ class RealGit(unittest.TestCase):
         plain = self.dir / "plain"
         plain.mkdir()
         self.assertEqual(up.check_git({"kind": "git", "path": str(plain)})[0], up.NO_SOURCE)
+
+
+class GitTagsReal(GitRepoCase):
+    """The git_tags kind against real temporary repositories (the remote is a local path, so no network)."""
+
+    def setUp(self):
+        super().setUp()
+        self.g(self.app, "tag", "v0.39.2")
+        self.g(self.app, "push", "-q", "origin", "v0.39.2")
+        self.g(self.app, "checkout", "-q", "--detach", "v0.39.2")  # like ComfyUI: detached at a tag
+
+    def release_from_other(self, *tags):
+        self.g(self.other, "pull", "-q", "origin", "main")
+        self.commit(self.other, f"f{len(tags)}{tags[0]}.txt", "x")
+        self.g(self.other, "push", "-q", "origin", "HEAD:main")
+        for tag in tags:
+            self.g(self.other, "tag", tag)
+            self.g(self.other, "push", "-q", "origin", tag)
+
+    def tags_updater(self, **extra):
+        bk = {"app": {"id": "app", "name": "App", "kind": "process",
+                      "update": {"kind": "git_tags", "path": str(self.app), **extra}}}
+        return up.Updater(lambda: bk, lambda bid: False)
+
+    def head_tags(self):
+        return self.g(self.app, "tag", "--points-at", "HEAD").split()
+
+    def test_detached_head_at_a_tag_with_a_newer_stable_release_is_available(self):
+        self.release_from_other("v0.39.3", "v0.40.0-rc1", "nightly", "release-2026")
+        status, detail = up.check_git_tags({"kind": "git_tags", "path": str(self.app)})
+        self.assertEqual((status, detail), (up.AVAILABLE, "0.39.2 to 0.39.3"))  # rc and non-version tags ignored
+
+    def test_up_to_date_when_no_newer_stable_tag(self):
+        self.release_from_other("v0.40.0-rc1", "nightly")
+        status, detail = up.check_git_tags({"kind": "git_tags", "path": str(self.app)})
+        self.assertEqual((status, detail), (up.UP_TO_DATE, "version 0.39.2"))
+
+    def test_min_release_keeps_small_gaps_off_the_badge(self):
+        self.release_from_other("v0.39.3")
+        u = {"kind": "git_tags", "path": str(self.app), "min_release": "minor"}
+        status, detail = up.check_git_tags(u)
+        self.assertEqual(status, up.NEWER)
+        self.assertIn("patch release, below the minor threshold", detail)
+        self.release_from_other("v0.40.0")
+        self.assertEqual(up.check_git_tags(u), (up.AVAILABLE, "0.39.2 to 0.40.0"))
+
+    def test_bad_settings_are_errors(self):
+        for extra in ({"min_release": "huge"}, {"min_release": ["minor"]}, {"remote": "-evil"}, {"remote": ["origin"]}):
+            status, detail = up.check_git_tags({"kind": "git_tags", "path": str(self.app), **extra})
+            self.assertEqual(status, up.ERROR, extra)
+            self.assertIn("Bad settings", detail)
+
+    def test_repository_with_no_tags_at_all_is_unknown(self):
+        empty_remote = self.dir / "empty.git"
+        self.g(self.dir, "init", "-q", "--bare", str(empty_remote))
+        bare = self.dir / "plain"
+        self.g(self.dir, "init", "-q", str(bare))
+        self.g(bare, "remote", "add", "origin", str(empty_remote))
+        self.commit(bare, "a.txt", "one")
+        status, detail = up.check_git_tags({"kind": "git_tags", "path": str(bare)})
+        self.assertEqual(status, up.UNKNOWN)
+        self.assertIn("no release tags", detail)
+
+    def test_only_unusable_tags_is_unknown(self):
+        for tag in ("v1.0.0-rc1", "nightly", "v1.2", "V2.0.0"):
+            self.g(self.app, "tag", tag)
+        self.g(self.app, "tag", "-d", "v0.39.2")
+        self.g(self.app, "push", "-q", "origin", ":refs/tags/v0.39.2")
+        status, detail = up.check_git_tags({"kind": "git_tags", "path": str(self.app)})
+        self.assertEqual(status, up.UNKNOWN)
+        self.assertIn("no release tags", detail)
+
+    def test_head_before_any_release_tag_is_unknown_with_a_reason(self):
+        self.g(self.app, "checkout", "-q", "--detach", "main")  # still the same commit as the tag
+        self.g(self.app, "tag", "-d", "v0.39.2")
+        self.g(self.app, "push", "-q", "origin", ":refs/tags/v0.39.2")
+        self.release_from_other("v0.40.0")  # a release exists, but our commit is before any tag
+        self.g(self.app, "checkout", "-q", "--detach", "main")
+        status, detail = up.check_git_tags({"kind": "git_tags", "path": str(self.app)})
+        self.assertEqual(status, up.UNKNOWN)
+        self.assertIn("not on or after any release tag", detail)
+
+    def test_fetch_failure_is_an_error(self):
+        self.g(self.app, "remote", "set-url", "origin", str(self.dir / "does-not-exist.git"))
+        status, detail = up.check_git_tags({"kind": "git_tags", "path": str(self.app)})
+        self.assertEqual(status, up.ERROR)
+        self.assertIn("git fetch failed", detail)
+
+    def test_not_a_git_checkout_or_missing_folder(self):
+        plain = self.dir / "folder"
+        plain.mkdir()
+        self.assertEqual(up.check_git_tags({"kind": "git_tags", "path": str(plain)})[0], up.NO_SOURCE)
+        self.assertEqual(up.check_git_tags({"kind": "git_tags", "path": str(self.dir / "nope")})[0], up.NO_SOURCE)
+
+    def test_a_head_that_is_past_a_tag_says_it_is_not_on_a_release(self):
+        self.g(self.app, "checkout", "-q", "main")
+        self.commit(self.app, "extra.txt", "x")
+        self.g(self.app, "push", "-q", "origin", "HEAD:main")
+        self.release_from_other("v0.39.3")
+        status, detail = up.check_git_tags({"kind": "git_tags", "path": str(self.app)})
+        self.assertEqual(status, up.AVAILABLE)
+        self.assertIn("0.39.2 to 0.39.3", detail)
+        self.assertIn("HEAD is not exactly on a release tag", detail)
+
+    def test_a_stable_tag_at_head_beats_a_release_candidate_there(self):
+        self.g(self.app, "tag", "v0.40.0-rc1")
+        self.assertEqual(up.current_release(str(self.app)), ("v0.39.2", True))
+
+    def test_full_update_checks_out_the_tag_and_runs_the_install_command(self):
+        self.release_from_other("v0.39.3")
+        u = self.tags_updater(post_command="touch installed.txt")
+        u.check_all()
+        row = u.snapshot()["items"][0]
+        self.assertEqual(row["status"], up.AVAILABLE)
+        self.assertEqual(u.apply("app", background=False)[0], 202)
+        row = u.snapshot()["items"][0]
+        self.assertEqual(row["status"], up.UP_TO_DATE, row["detail"])
+        self.assertEqual(self.head_tags(), ["v0.39.3"])
+        self.assertTrue((self.app / "installed.txt").exists())
+        self.assertIn("pull ok", row["progress"])
+        self.assertIn("install ok", row["progress"])
+        self.assertIn("verify ok", row["progress"])
+        self.assertIn("== install started ==", row["output_tail"])
+
+    def test_dirty_working_tree_is_refused_and_nothing_changes(self):
+        self.release_from_other("v0.39.3")
+        u = self.tags_updater()
+        u.check_all()
+        (self.app / "a.txt").write_text("edited by hand")
+        code, obj = u.apply("app", background=False)
+        self.assertEqual(code, 409)
+        self.assertIn("local changes", obj["error"])
+        self.assertEqual(self.head_tags(), ["v0.39.2"])
+        self.assertEqual((self.app / "a.txt").read_text(), "edited by hand")  # never reset or cleaned
+
+    def test_a_commit_that_no_branch_or_tag_holds_is_not_left_behind(self):
+        self.release_from_other("v0.39.3")
+        u = self.tags_updater()
+        u.check_all()
+        self.commit(self.app, "mine.txt", "local work")  # detached commit, on no branch
+        before = self.g(self.app, "rev-parse", "HEAD")
+        code, obj = u.apply("app", background=False)
+        self.assertEqual(code, 409)
+        self.assertIn("not on any branch or tag", obj["error"])
+        self.assertEqual(self.g(self.app, "rev-parse", "HEAD"), before)
+
+    def test_failed_install_reports_the_state_and_keeps_the_update_open(self):
+        self.release_from_other("v0.39.3")
+        u = self.tags_updater(post_command="false")
+        u.check_all()
+        u.apply("app", background=False)
+        row = u.snapshot()["items"][0]
+        self.assertEqual(row["status"], up.ERROR)
+        self.assertIn("install failed", row["detail"])
+        self.assertIn("the new release v0.39.3 is checked out", row["detail"])
+        self.assertIn("v0.39.2", row["detail"])  # what was there before
+        self.assertTrue(row["can_apply"])  # the incomplete-update marker
+        self.assertEqual(self.head_tags(), ["v0.39.3"])
+        u._check_one("app")  # now HEAD is on the newest tag, but the update is not finished
+        row = u.snapshot()["items"][0]
+        self.assertEqual(row["status"], up.ERROR)
+        self.assertIn("Last update stopped at install", row["detail"])
+        self.assertTrue(row["can_apply"])
+
+    def test_failed_checkout_changes_nothing_and_is_not_an_incomplete_update(self):
+        self.release_from_other("v0.39.3")
+        u = self.tags_updater()
+        u.check_all()
+        u._cache["app"]["meta"]["tag"] = "v9.9.9"  # a tag that does not exist locally
+        u.apply("app", background=False)
+        row = u.snapshot()["items"][0]
+        self.assertEqual(row["status"], up.ERROR)
+        self.assertIn("pull failed", row["detail"])
+        self.assertIn("Press Check again to retry.", row["detail"])
+        self.assertFalse(row["can_apply"])
+        self.assertEqual(self.head_tags(), ["v0.39.2"])
+
+    def test_verify_fails_when_head_is_not_on_the_chosen_tag(self):
+        self.release_from_other("v0.39.3")
+        self.g(self.app, "fetch", "-q", "--tags", "origin")
+        ok, _, reason = up.verify_git_tags(str(self.app), {}, {"tag": "v0.39.3"})
+        self.assertFalse(ok)
+        self.assertIn("is not on v0.39.3", reason)
+        self.g(self.app, "checkout", "-q", "--detach", "v0.39.3")
+        self.assertTrue(up.verify_git_tags(str(self.app), {}, {"tag": "v0.39.3"})[0])
+        ok, _, reason = up.verify_git_tags(str(self.app), {"verify_command": "false"}, {"tag": "v0.39.3"})
+        self.assertFalse(ok)
+        self.assertIn("verify command failed", reason)
+        self.assertFalse(up.verify_git_tags(str(self.app), {}, {})[0])  # no chosen tag
+        self.assertFalse(up.verify_git_tags(str(self.app), {}, {"tag": "--evil"})[0])
+
+
+class GitTagsUnit(Patched):
+    def test_newest_stable_tag_ignores_everything_else(self):
+        text = "\n".join(["v0.9.0", "v0.10.0", "v0.10.0-rc1", "v1.0", "V2.0.0", "nightly", "v0.10.1\x00",
+                          " v0.9.9 ", "v1.2.3.4", "v-1.0.0", "v99999999999.0.0", "v1.0.0+build", "", "v0.10.0 "])
+        self.assertEqual(up.newest_stable_tag(text), ("v0.10.0", (0, 10, 0)))  # numeric, not alphabetical
+        self.assertIsNone(up.newest_stable_tag(""))
+        self.assertIsNone(up.newest_stable_tag(None))
+        self.assertIsNone(up.newest_stable_tag("v1.0.0-rc1\nlatest"))
+
+    def test_hostile_tag_output_is_bounded(self):
+        many = "\n".join(["junk"] * (up.MAX_TAG_LINES + 10) + ["v9.9.9"])
+        self.assertIsNone(up.newest_stable_tag(many))  # the real tag is past the cap
+        self.assertIsNone(up.newest_stable_tag("v" + "1" * 5000 + ".0.0"))
+        self.assertEqual(up.newest_stable_tag("v1.2.3\n" + "x" * 100000), ("v1.2.3", (1, 2, 3)))
+
+    def test_fetch_timeout_is_an_error_not_a_hang(self):
+        self.patch(FakeRun([("rev-parse --is-inside", (0, "true")), ("fetch", (124, "command timed out"))]))
+        status, detail = up.check_git_tags({"kind": "git_tags", "path": "/tmp"})
+        self.assertEqual(status, up.ERROR)
+        self.assertIn("git fetch failed", detail)
+
+    def test_dispatch_and_defaults(self):
+        self.assertIn("git_tags", up.KINDS)
+        b = {"id": "c", "name": "C", "kind": "process",
+             "update": {"kind": "git_tags", "path": "/tmp", "post_command": "make"}}
+        self.assertEqual([s.name for s in up.build_steps(b, {"tag": "v1.0.0"})], ["pull", "install", "verify"])
+        b["update"].pop("post_command")
+        self.assertEqual([s.name for s in up.build_steps(b, {"tag": "v1.0.0"})], ["pull", "verify"])
+        b["update"]["remote"] = "bad name"
+        with self.assertRaises(ValueError):
+            up.build_steps(b, {})
+
+    def test_pull_without_a_chosen_tag_runs_no_git_command(self):
+        fake = FakeRun()
+        self.patch(fake)
+        b = {"id": "c", "name": "C", "kind": "process", "update": {"kind": "git_tags", "path": "/tmp"}}
+        ok, name, reason, _ = up.run_steps(up.build_steps(b, {}))
+        self.assertEqual((ok, name), (False, "pull"))
+        self.assertIn("Check again", reason)
+        self.assertEqual(fake.calls, [])
+
+    def test_checked_in_comfyui_entry_follows_release_tags(self):
+        cfg = {x["id"]: x for x in json.loads((Path(__file__).resolve().parent.parent / "backends.json").read_text())["backends"]}
+        u = cfg["comfyui"]["update"]
+        self.assertEqual(u["kind"], "git_tags")
+        self.assertEqual(u["path"], "/home/james/ComfyUI")
+        self.assertIn(u["min_release"], ("patch", "minor", "major"))
 
 
 class SafetyRules(Patched):
