@@ -110,7 +110,8 @@
         "kind": "git_tags",
         "path": "/home/james/ComfyUI",
         "python": "/home/james/ComfyUI/venv/bin/python",
-        "min_release": "minor"
+        "min_release": "minor",
+        "ignore_dirty_paths": ["models/"]
       }
     },
     {

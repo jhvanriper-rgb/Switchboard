@@ -42,7 +42,7 @@ KINDS = ("git", "git_tags", "pip", "github_release", "docker")
 # "update_while_running": true (Ollama: its installer restarts the service itself).
 
 NO_SUCH = re.compile(r"no such (object|container)", re.I)
-_VERSION_RE = re.compile(r"\d+(?:\.\d+)+")
+_VERSION_RE = re.compile(r"\d+(?:\.\d+)+", re.ASCII)  # ASCII digits only
 
 
 # ---------- the two replaceable edges ----------
@@ -354,7 +354,7 @@ def decide_git(behind, min_behind=1):
 
 
 RELEASE_LEVELS = {"patch": 0, "minor": 1, "major": 2}
-_RELEASE_RE = re.compile(r"v?(\d+(?:\.\d+)+)(-[0-9A-Za-z][0-9A-Za-z.-]*)?")
+_RELEASE_RE = re.compile(r"v?(\d+(?:\.\d+)+)(-[0-9A-Za-z][0-9A-Za-z.-]*)?", re.ASCII)
 # -rc1, -beta.2, -alpha, -pre1, -dev mark a pre-release; other suffixes (-cuda, -r2) do not
 _PRERELEASE_RE = re.compile(r"-(?:rc|alpha|beta|pre|dev)[0-9.]*(?:-|$)", re.I)
 MAX_COMPONENT_DIGITS = 9
@@ -488,7 +488,8 @@ def check_git(u):
 
 
 # ---------- git_tags: a checkout that follows release tags (vMAJOR.MINOR.PATCH) ----------
-_STABLE_TAG_RE = re.compile(r"v(\d{1,9})\.(\d{1,9})\.(\d{1,9})")
+_PART = r"(0|[1-9][0-9]{0,8})"  # ASCII digits, no leading zeros, bounded
+_STABLE_TAG_RE = re.compile(rf"v{_PART}\.{_PART}\.{_PART}")  # [0-9] only: v01.2.3, v0.39.02 and v\u0669.0.0 are not releases
 MAX_TAG_LINES = 50000  # more tag names than this are ignored (hostile or runaway output)
 MAX_TAG_CHARS = 64
 
@@ -519,6 +520,100 @@ def git_tags_remote(u):
     return v
 
 
+MAX_IGNORE_PATHS = 50
+MAX_IGNORE_CHARS = 200
+
+
+def ignore_dirty_paths(u):
+    """The "ignore_dirty_paths" list of a git_tags update object: plain paths, relative to the
+    repository, whose tracked changes do not count as local changes. Raises ValueError for
+    anything else (not a list, too many or too long entries, absolute paths, "..", a leading
+    "-", control characters)."""
+    v = u.get("ignore_dirty_paths")
+    if v is None:
+        return []
+    err = ('"ignore_dirty_paths" in backends.json must be a short list of plain paths relative to '
+           'the repository, such as ["models/"]')
+    if not isinstance(v, list) or len(v) > MAX_IGNORE_PATHS:
+        raise ValueError(err)
+    out = []
+    for p in v:
+        if (not isinstance(p, str) or not p.strip("/") or len(p) > MAX_IGNORE_CHARS or p.startswith(("/", "-"))
+                or any(ord(c) < 32 or ord(c) == 127 for c in p) or ".." in p.split("/") or "\\" in p):
+            raise ValueError(err)
+        out.append(p.strip("/"))
+    return out
+
+
+def under_ignored(path, ignored):
+    """Is this repository path one of the ignored paths, or inside one? "models" matches
+    models/x but not models2/x."""
+    return any(path == p or path.startswith(p + "/") for p in ignored)
+
+
+def parse_status_z(text):
+    """Paths in `git status --porcelain -z` output. A rename or copy lists two paths."""
+    paths, parts = [], (text or "").split("\0")
+    # the command runner strips the output, which can eat the leading space of the first entry (" D path")
+    if parts and len(parts[0]) >= 3 and parts[0][1] == " " and parts[0][2] != " ":
+        parts[0] = " " + parts[0]
+    i = 0
+    while i < len(parts):
+        entry = parts[i]
+        i += 1
+        if len(entry) < 4:
+            continue
+        paths.append([entry[3:]])
+        if entry[0] in "RC" or entry[1] in "RC":
+            if i < len(parts):
+                paths[-1].append(parts[i])
+                i += 1
+    return paths
+
+
+def blocking_changes(path, ignored):
+    """(rc, output, changes): the tracked changes in the working tree that are not under an ignored
+    path. Untracked files and directories never count. A rename counts unless both its paths
+    are ignored."""
+    rc, out = _git(path, "status", "--porcelain", "-z", "--untracked-files=no")
+    if rc != 0:
+        return rc, out, []
+    return rc, out, [p for p in parse_status_z(out) if not all(under_ignored(x, ignored) for x in p)]
+
+
+def tag_fetch_args(remote):
+    """git arguments that fetch only the version tags, forcing them to match the remote. A plain
+    `git fetch --tags` stops with "would clobber existing tag" when any tag, such as a moving
+    `latest`, changes upstream. Tags that do not start with v are never fetched, and the output
+    is kept so a failure has a reason."""
+    return ["fetch", "--no-tags", remote or "origin", "+refs/tags/v*:refs/tags/v*"]
+
+
+def move_guard(path, tag):
+    """May HEAD be moved to `tag` without going backwards or sideways? Returns
+    (ok, reason, is_error): is_error is True when git could not answer. Allowed when HEAD is
+    already at the tag, when HEAD is exactly on an older stable release tag, or when HEAD is an
+    ancestor of the tag."""
+    rc, head = _git(path, "rev-parse", "HEAD")
+    rc2, want = _git(path, "rev-parse", "--verify", "--quiet", f"refs/tags/{tag}^{{commit}}")
+    if rc != 0 or rc2 != 0:
+        return False, f"could not find {tag} in this checkout", True
+    if head.strip() == want.strip():
+        return True, "", False
+    cur = current_release(path)
+    m = _STABLE_TAG_RE.fullmatch(cur[0]) if cur and cur[1] else None
+    t = _STABLE_TAG_RE.fullmatch(tag)
+    if m and t and tuple(int(x) for x in m.groups()) < tuple(int(x) for x in t.groups()):
+        return True, "", False  # a move from one stable release to a newer one
+    rc3, out = _git(path, "merge-base", "--is-ancestor", "HEAD", f"refs/tags/{tag}^{{commit}}")
+    if rc3 == 0:
+        return True, "", False
+    if rc3 == 1:
+        return False, (f"HEAD is not behind {tag} (it is past it, or on another branch), so moving to it "
+                       "could go backwards or sideways"), False
+    return False, f"could not compare HEAD with {tag}: {tail_lines(out, 2)}", True
+
+
 def current_release(path):
     """(tag, exact) for the checked-out version, or None. `exact` is True when HEAD is exactly on
     a version tag (the newest one if several); otherwise the nearest version tag behind HEAD."""
@@ -526,7 +621,7 @@ def current_release(path):
     if rc == 0:
         found = [(parse_release(ln.strip()), ln.strip()) for ln in out.splitlines()[:200]
                  if len(ln.strip()) <= MAX_TAG_CHARS]
-        found = [(p[0], t) for p, t in found if p and re.fullmatch(r"v\d+(?:\.\d+)+(?:-[0-9A-Za-z.-]+)?", t)]
+        found = [(p[0], t) for p, t in found if p and re.fullmatch(r"v[0-9]+(?:\.[0-9]+)+(?:-[0-9A-Za-z.-]+)?", t)]
         if found:
             return max(found, key=lambda f: (not f[0][1], f[0][0]))[1], True  # a stable tag beats a release candidate
     rc, out = _git(path, "describe", "--tags", "--abbrev=0", "--match", "v[0-9]*")
@@ -540,6 +635,7 @@ def check_git_tags(u, meta=None):
     try:
         min_release = release_threshold(u)
         remote = git_tags_remote(u)
+        ignored = ignore_dirty_paths(u)
     except ValueError as e:
         return ERROR, f"Bad settings in backends.json: {e}"
     path = os.path.expanduser(u.get("path", ""))
@@ -548,9 +644,9 @@ def check_git_tags(u, meta=None):
     rc, out = _git(path, "rev-parse", "--is-inside-work-tree")
     if rc != 0 or out.strip() != "true":
         return NO_SOURCE, "not a git checkout"
-    rc, out = _git(path, "fetch", "--tags", "--quiet", *([remote] if remote else []))
+    rc, out = _git(path, *tag_fetch_args(remote))
     if rc != 0:
-        return ERROR, "git fetch failed: " + tail_lines(out, 3)
+        return ERROR, "git fetch failed: " + (tail_lines(out, 3) or f"exit {rc}")
     rc, out = _git(path, "tag", "--list")
     if rc != 0:
         return ERROR, "could not list tags: " + tail_lines(out, 3)
@@ -565,7 +661,20 @@ def check_git_tags(u, meta=None):
     status, detail = decide_release(tag, newest[0], min_release)
     if not exact:
         rc, desc = _git(path, "describe", "--tags", "--always")
-        detail += f" (HEAD is not exactly on a release tag: {last_line(desc) or tag})"
+        note = f"HEAD is not exactly on a release tag: {last_line(desc) or tag}"
+        if status in (AVAILABLE, NEWER):
+            # the nearest tag behind HEAD says nothing about the newest release's history: it may
+            # sit on another branch, and moving there would be a downgrade
+            ok, reason, is_error = move_guard(path, newest[0])
+            if not ok:
+                if is_error:
+                    return UNKNOWN, reason
+                return UP_TO_DATE, f"HEAD is past the newest release {newest[0]} ({note})"
+        detail += f" ({note})"
+    if status in (AVAILABLE, NEWER):
+        rc, out, changes = blocking_changes(path, ignored)
+        if rc == 0 and changes:
+            detail += " (the working tree has local changes, so an update is refused until they are committed or stashed)"
     return status, detail
 
 
@@ -773,6 +882,7 @@ def git_steps(b, u, meta):
 def git_tags_steps(b, u, meta):
     path = os.path.expanduser(u.get("path", ""))
     remote = git_tags_remote(u)
+    ignored = ignore_dirty_paths(u)
     state = {}
 
     def tag():
@@ -782,26 +892,66 @@ def git_tags_steps(b, u, meta):
         return t
 
     def pull():
-        # fetch the tags again, then move to the chosen one. Nothing is reset or cleaned: git
-        # itself refuses to overwrite local changes, and the precheck already refuses a dirty tree.
+        # Fetch the version tags again, make sure the move is not backwards or sideways, then
+        # check the chosen tag out. Nothing is reset or cleaned: git itself refuses to overwrite
+        # local changes, and the precheck already refuses a dirty tree.
+        pull_step.safe_on_fail = True
         try:
             t = tag()
         except ValueError as e:
             return False, str(e), str(e)
+        rc, out, changes = blocking_changes(path, ignored)  # the same rule as the precheck, right before the move
+        if rc != 0:
+            return False, out, f"could not read the git status: {last_line(out)}"
+        if changes:
+            return False, "\n".join(p[0] for p in changes[:20]), "the working tree has local changes. Commit or stash them first."
+        # On a retry after a failed install HEAD is already on the new tag; the marker remembers
+        # what was checked out before the first attempt.
         rc, prev = _git(path, "describe", "--tags", "--always")
-        state["prev"] = last_line(prev) or "an unknown commit"
+        first = (meta.get("_incomplete") or {}).get("prev")
+        state["prev"] = first or last_line(prev) or "an unknown commit"
+        meta["prev"] = state["prev"]
         log = [f"previous checkout: {state['prev']}"]
-        for args in (["fetch", "--tags", "--quiet"] + ([remote] if remote else []),
-                     ["-c", "advice.detachedHead=false", "checkout", "--detach", f"refs/tags/{t}"]):
-            rc, out = run_command(["git", "-C", path, *args], env={"GIT_TERMINAL_PROMPT": "0"}, timeout=APPLY_TIMEOUT)
-            log.append("$ git " + " ".join(args) + "\n" + out)
-            ok, _, reason = cmd_result(rc, out, APPLY_TIMEOUT)
-            if not ok:
-                return False, "\n".join(log), f"{reason} (nothing was changed; {state['prev']} is still checked out)"
+        rc, out = run_command(["git", "-C", path, *tag_fetch_args(remote)], env={"GIT_TERMINAL_PROMPT": "0"},
+                              timeout=APPLY_TIMEOUT)
+        log.append("$ git " + " ".join(tag_fetch_args(remote)) + "\n" + out)
+        ok, _, reason = cmd_result(rc, out, APPLY_TIMEOUT)
+        if not ok:
+            return False, "\n".join(log), f"{reason} (nothing was changed; {state['prev']} is still checked out)"
+        allowed, why, _ = move_guard(path, t)
+        if not allowed:
+            log.append(why)
+            return False, "\n".join(log), f"{why} (nothing was changed; {state['prev']} is still checked out)"
+        if ignored:
+            # git would replace a symlink that stands where the release has tracked files, so a
+            # release that touches an ignored path is not checked out at all
+            rc, names = _git(path, "diff", "--name-only", "-z", "HEAD", f"refs/tags/{t}")
+            hit = [n for n in names.split("\0") if n and under_ignored(n, ignored)] if rc == 0 else []
+            if rc != 0 or hit:
+                why = (f"the release {t} changes files under an ignored path ({hit[0]}); update by hand"
+                       if hit else f"could not compare {state['prev']} with {t}: {last_line(names)}")
+                log.append(why)
+                return False, "\n".join(log), f"{why} (nothing was changed; {state['prev']} is still checked out)."
+        args = ["-c", "advice.detachedHead=false", "checkout", "--detach", f"refs/tags/{t}"]
+        rc, out = run_command(["git", "-C", path, *args], env={"GIT_TERMINAL_PROMPT": "0"}, timeout=APPLY_TIMEOUT)
+        log.append("$ git " + " ".join(args) + "\n" + out)
+        ok, _, reason = cmd_result(rc, out, APPLY_TIMEOUT)
+        if not ok:
+            if rc == 124:  # timed out: git may have been part-way through writing files
+                pull_step.safe_on_fail = False
+                return False, "\n".join(log), (f"checkout timed out; the working tree may be only partly updated "
+                                               f"(it was on {state['prev']})")
+            hint = ""
+            if ignored and ("beyond a symbolic link" in out or any(p in out for p in ignored)):
+                hint = " The new release changes files under an ignored path; update by hand."
+            return False, "\n".join(log), f"{reason} (git refused; nothing was changed; {state['prev']} is still checked out).{hint}"
         return True, "\n".join(log), f"now on {t}"
 
-    steps = [Step("pull", pull, safe_on_fail=True)]
+    pull_step = Step("pull", pull, safe_on_fail=True)
+    steps = [pull_step]
     parts = []
+    # Like the git kind, requirements.txt is looked for when the steps are built, so a file that
+    # the checkout itself brings in is not installed on the first update.
     req = os.path.join(path, "requirements.txt")
     if u.get("python") and os.path.isfile(req):
         parts.append(([os.path.expanduser(u["python"]), "-m", "pip", "install", "-r", req], path, False, APPLY_TIMEOUT))
@@ -1154,17 +1304,23 @@ def precheck_apply(b):
     custom = u.get("steps") is not None or u.get("script")
     if kind in ("git", "git_tags"):
         path = os.path.expanduser(u.get("path", ""))
-        rc, out = _git(path, "status", "--porcelain", "--untracked-files=no")
+        try:
+            ignored = ignore_dirty_paths(u) if kind == "git_tags" else []
+        except ValueError as e:
+            return f"Bad update settings for {b['name']}: {e}"
+        rc, out, changes = blocking_changes(path, ignored)  # untracked files never block
         if rc != 0:
             return f"Could not read git status for {b['name']}: {tail_lines(out, 2)}"
-        if out.strip():
+        if changes:
             return f"{b['name']} has local changes in {path}. Commit or stash them first."
     if kind == "git_tags":
         # moving to a tag leaves the current commit behind; refuse if nothing else would keep it
         path = os.path.expanduser(u.get("path", ""))
         rc, out = _git(path, "for-each-ref", "--contains", "HEAD", "--count=1", "--format=%(refname)",
                        "refs/heads", "refs/remotes", "refs/tags")
-        if rc == 0 and not out.strip():
+        if rc != 0:
+            return f"Could not check whether the current commit of {b['name']} is held by a branch or tag: {tail_lines(out, 2)}"
+        if not out.strip():
             return (f"{b['name']} is on a commit that is not on any branch or tag in {path}. "
                     "Moving to a release would leave it behind. Create a branch for it first.")
     if not custom and kind in ("docker", "github_release") and not u.get("apply_command"):
@@ -1403,6 +1559,7 @@ class Updater:
             try:
                 if not meta:
                     run_check(b, meta, check_budget(b, self._timeout))  # read-only; fills in what verify compares with
+                meta["_incomplete"] = inc  # lets a step see an earlier unfinished attempt
                 steps = build_steps(b, meta)
             except Exception as e:  # noqa: BLE001
                 self._store(bid, ERROR, f"Could not start the update: {e}")
@@ -1426,8 +1583,10 @@ class Updater:
                     self._store(bid, ERROR, f"{name} failed: {reason}\nNothing was changed. Press Check again to retry.\n{tail}",
                                 steps=prog, incomplete=inc)
                 else:
-                    self._store(bid, ERROR, f"{name} failed: {reason}\n{tail}", steps=prog,
-                                incomplete={"step": name, "reason": reason})
+                    marker = {"step": name, "reason": reason}
+                    if meta.get("prev"):  # what was there before the update, kept across retries
+                        marker["prev"] = meta["prev"]
+                    self._store(bid, ERROR, f"{name} failed: {reason}\n{tail}", steps=prog, incomplete=marker)
                 return
             meta2 = {}
             budget = check_budget(b, self._timeout)

@@ -1367,7 +1367,6 @@ class GitRepoCase(unittest.TestCase):
         return u.snapshot()["items"][0]
 
 
-
 class RealGit(GitRepoCase):
     def test_clean_fast_forward_succeeds(self):
         self.publish_from_other()
@@ -1498,6 +1497,7 @@ class GitTagsReal(GitRepoCase):
         status, detail = up.check_git_tags({"kind": "git_tags", "path": str(self.app)})
         self.assertEqual(status, up.ERROR)
         self.assertIn("git fetch failed", detail)
+        self.assertIn("correct access rights", detail)  # git's own reason is kept, not hidden
 
     def test_not_a_git_checkout_or_missing_folder(self):
         plain = self.dir / "folder"
@@ -1569,6 +1569,10 @@ class GitTagsReal(GitRepoCase):
         self.assertIn("v0.39.2", row["detail"])  # what was there before
         self.assertTrue(row["can_apply"])  # the incomplete-update marker
         self.assertEqual(self.head_tags(), ["v0.39.3"])
+        u.apply("app", background=False)  # retry: HEAD is already on the new tag, but the old one is remembered
+        row = u.snapshot()["items"][0]
+        self.assertIn("before the update it was v0.39.2", row["detail"])
+        self.assertNotIn("before the update it was v0.39.3", row["detail"])
         u._check_one("app")  # now HEAD is on the newest tag, but the update is not finished
         row = u.snapshot()["items"][0]
         self.assertEqual(row["status"], up.ERROR)
@@ -1601,6 +1605,199 @@ class GitTagsReal(GitRepoCase):
         self.assertIn("verify command failed", reason)
         self.assertFalse(up.verify_git_tags(str(self.app), {}, {})[0])  # no chosen tag
         self.assertFalse(up.verify_git_tags(str(self.app), {}, {"tag": "--evil"})[0])
+
+
+    def tags_b(self, **extra):
+        return {"id": "app", "name": "App", "kind": "process",
+                "update": {"kind": "git_tags", "path": str(self.app), **extra}}
+
+    def test_tags_that_move_upstream_do_not_break_the_check(self):
+        import subprocess
+        self.release_from_other("v0.40.0-rc1", "nightly")
+        self.g(self.app, "tag", "nightly")  # a local copy of a tag that will move
+        u = {"kind": "git_tags", "path": str(self.app)}
+        self.assertEqual(up.check_git_tags(u)[0], up.UP_TO_DATE)
+        # move a non-version tag AND a version-looking tag upstream
+        self.g(self.other, "pull", "-q", "origin", "main")
+        self.commit(self.other, "moved.txt", "x")
+        self.g(self.other, "push", "-q", "origin", "HEAD:main")
+        for tag in ("nightly", "v0.40.0-rc1"):
+            self.g(self.other, "tag", "-f", tag)
+            self.g(self.other, "push", "-q", "-f", "origin", tag)
+        plain = subprocess.run(["git", "-C", str(self.app), "fetch", "--tags"], env=self.environ,
+                               capture_output=True, text=True)
+        self.assertNotEqual(plain.returncode, 0, "the plain fetch is expected to fail on a moved tag")
+        self.assertIn("clobber", plain.stderr)
+        status, detail = up.check_git_tags(u)
+        self.assertEqual(status, up.UP_TO_DATE, detail)
+        self.release_from_other("v0.39.3")
+        self.assertEqual(up.check_git_tags(u), (up.AVAILABLE, "0.39.2 to 0.39.3"))
+
+    def test_a_release_on_another_branch_is_not_a_downgrade(self):
+        self.g(self.other, "pull", "-q", "origin", "main")
+        self.g(self.other, "checkout", "-q", "-b", "side")
+        self.commit(self.other, "side.txt", "x")
+        self.g(self.other, "tag", "v0.39.3")
+        self.g(self.other, "push", "-q", "origin", "v0.39.3")
+        self.g(self.app, "checkout", "-q", "main")
+        for n in range(3):
+            self.commit(self.app, f"past{n}.txt", "x")  # 3 commits past v0.39.2
+        status, detail = up.check_git_tags({"kind": "git_tags", "path": str(self.app)})
+        self.assertEqual(status, up.UP_TO_DATE, detail)
+        self.assertIn("HEAD is past the newest release v0.39.3", detail)
+        # and the pull step refuses on its own, even if told to go there
+        before = self.g(self.app, "rev-parse", "HEAD")
+        ok, name, reason, _ = up.run_steps(up.build_steps(self.tags_b(), {"tag": "v0.39.3"}))
+        self.assertEqual((ok, name), (False, "pull"))
+        self.assertIn("HEAD is not behind v0.39.3", reason)
+        self.assertEqual(self.g(self.app, "rev-parse", "HEAD"), before)
+        self.assertEqual(self.g(self.app, "rev-parse", "--abbrev-ref", "HEAD"), "main")
+
+    def test_a_retry_on_a_release_candidate_newer_than_the_newest_stable_tag_does_not_downgrade(self):
+        self.release_from_other("v0.40.0-rc1")
+        self.g(self.app, "fetch", "-q", "--tags", "origin")
+        self.g(self.app, "checkout", "-q", "--detach", "v0.40.0-rc1")
+        u = self.tags_updater()
+        u._store("app", up.ERROR, "x", meta={"tag": "v0.39.2"},
+                 incomplete={"step": "install", "reason": "x", "prev": "v0.39.2"})
+        code, obj = u.apply("app", background=False)
+        self.assertEqual(code, 202)
+        row = u.snapshot()["items"][0]
+        self.assertEqual(row["status"], up.ERROR)
+        self.assertIn("pull failed", row["detail"])
+        self.assertIn("not behind v0.39.2", row["detail"])
+        self.assertEqual(self.head_tags(), ["v0.40.0-rc1"])
+
+    def test_a_move_between_stable_releases_on_different_branches_is_allowed(self):
+        self.g(self.other, "pull", "-q", "origin", "main")
+        self.g(self.other, "checkout", "-q", "-b", "side")
+        self.commit(self.other, "side.txt", "x")
+        self.g(self.other, "tag", "v0.39.3")
+        self.g(self.other, "push", "-q", "origin", "v0.39.3")
+        self.g(self.app, "fetch", "-q", "--tags", "origin")
+        ok, _, _ = up.move_guard(str(self.app), "v0.39.3")[:3]
+        self.assertTrue(ok)  # HEAD is exactly on the older stable v0.39.2
+
+    # --- ignore_dirty_paths ---
+    def models_release(self):
+        """The remote gets tracked files under models/ and models2/ in release v0.39.3; the app moves there."""
+        self.g(self.other, "pull", "-q", "origin", "main")
+        for rel, text in (("models/put_checkpoints_here", ""), ("models/configs/a.yaml", "a: 1"),
+                          ("models2/keep.txt", "keep")):
+            p = self.other / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(text)
+        self.g(self.other, "add", "-A")
+        self.g(self.other, "commit", "-q", "-m", "models")
+        self.g(self.other, "push", "-q", "origin", "HEAD:main")
+        self.g(self.other, "tag", "v0.39.3")
+        self.g(self.other, "push", "-q", "origin", "v0.39.3")
+        self.g(self.app, "fetch", "-q", "--tags", "origin")
+        self.g(self.app, "checkout", "-q", "--detach", "v0.39.3")
+
+    def apply_result(self, **extra):
+        u = self.tags_updater(**extra)
+        u.check_all()
+        return u, u.apply("app", background=False)
+
+    def test_untracked_files_and_directories_never_block(self):
+        self.release_from_other("v0.39.3")
+        (self.app / "scratch.txt").write_text("x")
+        (self.app / "Claude outputs").mkdir()
+        (self.app / "Claude outputs" / "out.png").write_text("x")
+        u, (code, obj) = self.apply_result()
+        self.assertEqual(code, 202)
+        self.assertEqual(self.head_tags(), ["v0.39.3"])
+        self.assertTrue((self.app / "scratch.txt").exists())  # never cleaned
+
+    def test_a_deleted_tracked_file_under_an_ignored_prefix_does_not_block(self):
+        self.models_release()
+        self.release_from_other("v0.39.4")
+        (self.app / "models" / "put_checkpoints_here").unlink()
+        u, (code, obj) = self.apply_result(ignore_dirty_paths=["models/"])
+        self.assertEqual(code, 202, obj)
+        self.assertEqual(self.head_tags(), ["v0.39.4"])
+
+    def test_a_modified_file_outside_the_prefix_still_blocks(self):
+        self.models_release()
+        self.release_from_other("v0.39.4")
+        (self.app / "a.txt").write_text("edited")
+        u, (code, obj) = self.apply_result(ignore_dirty_paths=["models/"])
+        self.assertEqual(code, 409)
+        self.assertIn("local changes", obj["error"])
+        self.assertEqual(self.head_tags(), ["v0.39.3"])
+
+    def test_a_prefix_that_only_partly_matches_a_directory_name_does_not_match(self):
+        self.models_release()
+        self.release_from_other("v0.39.4")
+        (self.app / "models2" / "keep.txt").unlink()
+        u, (code, obj) = self.apply_result(ignore_dirty_paths=["models/"])
+        self.assertEqual(code, 409)
+        self.assertIn("local changes", obj["error"])
+        self.assertFalse(up.under_ignored("models2/keep.txt", ["models"]))
+        self.assertTrue(up.under_ignored("models/x/y", ["models"]))
+        self.assertTrue(up.under_ignored("models", ["models"]))
+
+    def symlink_models(self):
+        import shutil
+        storage = self.dir / "storage"
+        (storage / "checkpoints").mkdir(parents=True)
+        shutil.rmtree(self.app / "models")
+        os.symlink(storage, self.app / "models")
+
+    def test_the_models_symlink_case_blocks_without_the_setting_and_passes_with_it(self):
+        self.models_release()
+        self.release_from_other("v0.39.4")
+        self.symlink_models()
+        status = self.g(self.app, "status", "--short")
+        self.assertIn(" D models/put_checkpoints_here", status)
+        self.assertIn("?? models", status)
+        u, (code, obj) = self.apply_result()
+        self.assertEqual(code, 409)
+        self.assertIn("local changes", obj["error"])
+        self.assertEqual(self.head_tags(), ["v0.39.3"])
+        u, (code, obj) = self.apply_result(ignore_dirty_paths=["models/"])
+        self.assertEqual(code, 202, obj)
+        row = u.snapshot()["items"][0]
+        self.assertEqual(row["status"], up.UP_TO_DATE, row["detail"])
+        self.assertEqual(self.head_tags(), ["v0.39.4"])
+        self.assertTrue((self.app / "models").is_symlink())  # the symlink was left alone
+
+    def test_a_release_that_changes_files_under_the_ignored_path_is_reported_to_update_by_hand(self):
+        self.models_release()
+        self.g(self.other, "pull", "-q", "origin", "main")
+        (self.other / "models" / "configs" / "a.yaml").write_text("a: 2")
+        self.g(self.other, "commit", "-q", "-am", "change a model config")
+        self.g(self.other, "push", "-q", "origin", "HEAD:main")
+        self.g(self.other, "tag", "v0.39.4")
+        self.g(self.other, "push", "-q", "origin", "v0.39.4")
+        self.symlink_models()
+        u, (code, obj) = self.apply_result(ignore_dirty_paths=["models/"])
+        self.assertEqual(code, 202, obj)
+        row = u.snapshot()["items"][0]
+        self.assertEqual(row["status"], up.ERROR)
+        self.assertIn("pull failed", row["detail"])
+        self.assertIn("update by hand", row["detail"])
+        self.assertIn("changes files under an ignored path (models/configs/a.yaml)", row["detail"])
+        self.assertIn("nothing was changed", row["detail"])
+        self.assertFalse(row["can_apply"])  # nothing changed, so no unfinished update
+        self.assertEqual(self.head_tags(), ["v0.39.3"])
+        self.assertTrue((self.app / "models").is_symlink())  # the symlink survived
+
+    def test_the_check_text_mentions_local_changes_unless_they_are_ignored(self):
+        self.models_release()
+        self.release_from_other("v0.39.4")
+        (self.app / "models" / "put_checkpoints_here").unlink()
+        plain = up.check_git_tags({"kind": "git_tags", "path": str(self.app)})
+        self.assertEqual(plain[0], up.AVAILABLE)
+        self.assertIn("local changes", plain[1])
+        ignoring = up.check_git_tags({"kind": "git_tags", "path": str(self.app), "ignore_dirty_paths": ["models/"]})
+        self.assertNotIn("local changes", ignoring[1])
+
+    def test_bad_ignore_settings_are_errors_in_the_row(self):
+        status, detail = up.check_git_tags({"kind": "git_tags", "path": str(self.app), "ignore_dirty_paths": ["../x"]})
+        self.assertEqual(status, up.ERROR)
+        self.assertIn("ignore_dirty_paths", detail)
 
 
 class GitTagsUnit(Patched):
@@ -1650,6 +1847,63 @@ class GitTagsUnit(Patched):
         self.assertEqual(u["kind"], "git_tags")
         self.assertEqual(u["path"], "/home/james/ComfyUI")
         self.assertIn(u["min_release"], ("patch", "minor", "major"))
+
+
+class GitTagsGuards(Patched):
+    def test_tag_regex_takes_only_ascii_digits_without_leading_zeros(self):
+        for bad in ("v\u0669.0.0", "v1.\u0661.0", "v01.2.3", "v0.39.02", "v1.2.03", "v00.1.2", "v1.2.3.4", "v1.2"):
+            self.assertIsNone(up.newest_stable_tag(bad), bad)
+        self.assertEqual(up.newest_stable_tag("v0.0.0\nv0.39.2\nv10.0.0"), ("v10.0.0", (10, 0, 0)))
+        self.assertNotEqual(up.parse_release("\u0669.0.0"), ((9, 0, 0), False))
+        self.assertNotIn(9, (up.parse_release("v\u0669.5.7") or ((),))[0])
+
+    def test_orphan_precheck_refuses_when_git_cannot_answer(self):
+        b = {"id": "c", "name": "C", "kind": "process", "update": {"kind": "git_tags", "path": "/tmp"}}
+        self.patch(FakeRun([("status --porcelain", (0, "")), ("for-each-ref", (124, "command timed out"))]))
+        refusal = up.precheck_apply(b)
+        self.assertIsNotNone(refusal)
+        self.assertIn("Could not check", refusal)
+        self.patch(FakeRun([("status --porcelain", (0, "")), ("for-each-ref", (0, "refs/heads/main"))]))
+        self.assertIsNone(up.precheck_apply(b))
+        self.patch(FakeRun([("status --porcelain", (0, "")), ("for-each-ref", (0, ""))]))
+        self.assertIn("not on any branch or tag", up.precheck_apply(b))
+
+    def test_a_timed_out_checkout_is_not_nothing_changed(self):
+        bk = {"app": {"id": "app", "name": "App", "kind": "process",
+                      "update": {"kind": "git_tags", "path": "/tmp"}}}
+        self.patch(FakeRun([("status --porcelain", (0, "")), ("for-each-ref", (0, "refs/heads/main")),
+                            ("checkout", (124, "command timed out"))], default=(0, "abc")))
+        u = up.Updater(lambda: bk, lambda bid: False)
+        u._store("app", up.AVAILABLE, "x", meta={"tag": "v0.39.3"})
+        u.apply("app", background=False)
+        row = u.snapshot()["items"][0]
+        self.assertEqual(row["status"], up.ERROR)
+        self.assertIn("checkout timed out", row["detail"])
+        self.assertIn("only partly updated", row["detail"])
+        self.assertNotIn("Nothing was changed", row["detail"])
+        self.assertTrue(row["can_apply"])  # the unfinished-update marker is set
+
+    def test_ignore_dirty_paths_validation(self):
+        self.assertEqual(up.ignore_dirty_paths({}), [])
+        self.assertEqual(up.ignore_dirty_paths({"ignore_dirty_paths": ["models/", "a/b"]}), ["models", "a/b"])
+        for bad in ("models/", [""], ["/"], ["/etc"], ["../x"], ["a/../b"], ["-x"], [3], [None], ["a\nb"], ["a\x00b"],
+                    ["x" * 201], ["p%d" % n for n in range(51)], {"a": 1}, ["a\\b"]):
+            with self.assertRaises(ValueError, msg=repr(bad)[:40]):
+                up.ignore_dirty_paths({"ignore_dirty_paths": bad})
+
+    def test_status_parsing_handles_renames_and_odd_names(self):
+        text = " D models/a\0R  new name.txt\0old.txt\0M  src/x.py\0"
+        self.assertEqual(up.parse_status_z(text), [["models/a"], ["new name.txt", "old.txt"], ["src/x.py"]])
+        self.assertEqual(up.parse_status_z(""), [])
+        self.assertEqual(up.parse_status_z("\0\0x\0"), [])  # junk is skipped, not a crash
+        self.patch(FakeRun([("status --porcelain", (0, "R  models/new\0models/old\0"))]))
+        self.assertEqual(up.blocking_changes("/x", ["models"])[2], [])  # both paths ignored
+        self.patch(FakeRun([("status --porcelain", (0, "R  other/new\0models/old\0"))]))
+        self.assertEqual(len(up.blocking_changes("/x", ["models"])[2]), 1)
+
+    def test_checked_in_comfyui_ignores_the_models_folder(self):
+        cfg = {x["id"]: x for x in json.loads((Path(__file__).resolve().parent.parent / "backends.json").read_text())["backends"]}
+        self.assertEqual(cfg["comfyui"]["update"]["ignore_dirty_paths"], ["models/"])
 
 
 class SafetyRules(Patched):
