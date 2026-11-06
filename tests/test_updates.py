@@ -2,7 +2,9 @@
 GitHub lookup are replaced with fakes. Run: python3 -m unittest discover -s tests -v
 """
 import json
+import os
 import socket
+import tempfile as tempfile_module
 import sys
 import threading
 import unittest
@@ -526,15 +528,104 @@ class LiveOutput(Patched):
         self.assertEqual(len(b.tail().splitlines()), 60)  # the API tail
         self.assertEqual(b.tail(500).splitlines()[0], "line 800")
 
-    def test_chunks_that_split_a_line_are_joined_and_carriage_returns_end_lines(self):
+    def test_chunks_that_split_a_line_are_joined(self):
         b = up.OutputBuffer()
         b.feed("hel")
-        b.feed("lo\nprogress 10%\rprogress 20%\r")
-        b.feed("tail")
-        self.assertEqual(b.tail().splitlines(), ["hello", "progress 10%", "progress 20%", "tail"])
+        b.feed("lo\nwor")
+        b.feed("ld\nrest")
+        self.assertEqual(b.tail().splitlines(), ["hello", "world", "rest"])
         b.finish()
         self.assertTrue(b.finished)
-        self.assertEqual(b.tail().splitlines()[-1], "tail")
+        self.assertIsNotNone(b.finished_at)
+        self.assertEqual(b.tail().splitlines()[-1], "rest")
+
+    def test_a_bare_carriage_return_replaces_the_line_like_a_progress_bar(self):
+        b = up.OutputBuffer()
+        b.feed("start\n10%\r20%\r30%\r")
+        self.assertEqual(b.line_count(), 1)  # only \n stores a line
+        self.assertEqual(b.tail().splitlines(), ["start", "30%"])
+        b.feed("40%\r")
+        b.feed("done\n")
+        self.assertEqual(b.tail().splitlines(), ["start", "done"])
+
+    def test_crlf_split_across_chunks_adds_no_blank_line(self):
+        b = up.OutputBuffer()
+        b.feed("one\r")
+        b.feed("\ntwo\r\n")
+        b.feed("three\r")
+        b.feed("\n")
+        self.assertEqual(b.tail().splitlines(), ["one", "two", "three"])
+        self.assertEqual(b.line_count(), 3)
+
+    def test_multibyte_character_split_between_reads_is_whole(self):
+        b = up.OutputBuffer()
+        import codecs
+        dec = codecs.getincrementaldecoder("utf-8")("replace")
+        b.feed(dec.decode(b"caf\xc3"))
+        b.feed(dec.decode(b"\xa9\n"))
+        self.assertEqual(b.tail(), "caf\u00e9")
+
+    def test_a_real_command_printing_a_split_character_shows_it_whole(self):
+        b = up.OutputBuffer()
+        up._ctx.sink = b
+        try:
+            rc, out = up.run_command(["sh", "-c", "printf 'caf\\303'; sleep 0.8; printf '\\251\\n'"], timeout=10)
+        finally:
+            up._ctx.sink = None
+        self.assertEqual(rc, 0)
+        self.assertEqual(b.tail(), "caf\u00e9")
+        self.assertEqual(out, "caf\u00e9")
+
+    def test_a_command_that_prints_faster_than_we_read_still_times_out(self):
+        import time
+        from unittest import mock
+        made = []
+        real = tempfile_module.TemporaryFile
+
+        def spy(*a, **k):
+            f = real(*a, **k)
+            made.append(f)
+            return f
+        b = up.OutputBuffer()
+        up._ctx.sink = b
+        t0 = time.monotonic()
+        try:
+            with mock.patch.object(up.tempfile, "TemporaryFile", spy):
+                rc, out = up.run_command(["sh", "-c", "yes"], timeout=2)
+        finally:
+            up._ctx.sink = None
+        # 124 when the timeout fires first; 125 when it wrote past the output-size limit first
+        # (`yes` can write hundreds of MB per second). Either way it is stopped promptly.
+        self.assertIn(rc, (124, 125))
+        self.assertLess(time.monotonic() - t0, 6)
+        self.assertTrue(made and all(f.closed for f in made), "the temp file must be closed (and so removed)")
+        self.assertLessEqual(b.line_count(), up.LIVE_LINES)
+
+    def test_a_chatty_but_slow_command_times_out_with_124(self):
+        import time
+        b = up.OutputBuffer()
+        up._ctx.sink = b
+        t0 = time.monotonic()
+        try:
+            rc, out = up.run_command(["sh", "-c", "while :; do echo tick; sleep 0.01; done"], timeout=1)
+        finally:
+            up._ctx.sink = None
+        self.assertEqual((rc, out), (124, "command timed out"))
+        self.assertLess(time.monotonic() - t0, 5)
+        self.assertIn("tick", b.tail())
+
+    def test_catching_up_skips_ahead_and_never_starts_inside_a_character(self):
+        import codecs
+        with tempfile_module.TemporaryFile() as f:
+            f.write(b"x" * (up.PUMP_LAG * 3) + "\u00e9".encode() * 10)
+            f.flush()
+            b = up.OutputBuffer()
+            dec = codecs.getincrementaldecoder("utf-8")("replace")
+            pos = up._pump(f, 0, b, dec)
+            self.assertEqual(pos, os.fstat(f.fileno()).st_size)
+            self.assertNotIn("\ufffd", b.tail())
+            # a position inside a multi-byte character is moved past it
+            self.assertEqual(up._skip_continuation(f, up.PUMP_LAG * 3 + 1, pos), up.PUMP_LAG * 3 + 2)
 
     def test_every_step_gets_a_marker_in_order(self):
         b = up.OutputBuffer()
@@ -633,6 +724,9 @@ class LiveOutput(Patched):
         self.assertFalse(row["applying"])
         self.assertIn("== verify ok", row["output_tail"])
         self.assertTrue(u._out["pip"].finished)
+        self.assertIsNone(next(i for i in u.snapshot()["items"] if i["id"] == "git")["output_at"])
+        self.assertIsNotNone(row["output_at"])
+        self.assertLessEqual(row["checked_at"], row["output_at"] + 2)  # so the page shows the live tail
         # the next update starts with a fresh buffer
         u._store("pip", up.AVAILABLE, "x", meta={"installed": (1, 0), "latest": (1, 2, 0)})
         gate.clear()
@@ -652,7 +746,8 @@ class LiveOutput(Patched):
         section = html[a:b] + html[a2:html.index("\n}\n", a2)]
         self.assertNotIn("innerHTML", section)
         self.assertIn("pre.textContent = text", section)
-        self.assertRegex(html, r"upd\.applying \? 1500 : \(updOpen \|\| upd\.checking\) \? 3000")
+        self.assertRegex(html, r"updOpen \? \(upd\.applying \? 1500 : 3000\) : \(upd\.applying \|\| upd\.checking\) \? 3000 : 60000")
+        self.assertIn("output_at", html)
 
 
 class StepRunner(Patched):

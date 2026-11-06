@@ -8,6 +8,7 @@ only download). Updates are applied only when apply() is called for one id.
 All command execution goes through run_command() and all web lookups through fetch_json(),
 so tests can replace those two functions.
 """
+import codecs
 import json
 import math
 import os
@@ -54,14 +55,17 @@ _CTRL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 
 class OutputBuffer:
     """The recent output of one backend's update: the last LIVE_LINES lines, plus a line
-    at the start of every step. Bounded: long lines are cut, control characters and
-    terminal escape codes are removed, and old lines fall off the front."""
+    at the start of every step. Bounded: long lines are cut (the first LIVE_LINE_CHARS
+    characters are kept), control characters and terminal escape codes are removed, and old
+    lines fall off the front."""
 
     def __init__(self):
         self._lock = threading.Lock()
         self._lines = []
-        self._partial = ""
+        self._partial = ""  # the line being written; a bare \r starts it over (progress bars)
+        self._held_cr = False  # a trailing \r waits for the next chunk, which may begin with \n
         self.finished = False
+        self.finished_at = None
 
     @staticmethod
     def _clean(line):
@@ -73,15 +77,25 @@ class OutputBuffer:
             del self._lines[:len(self._lines) - LIVE_LINES]
 
     def feed(self, text):
-        """Add raw command output (any chunking; \\n and \\r both end a line)."""
+        """Add raw command output in any chunking. \\n (or \\r\\n) ends a line; a bare \\r
+        replaces the current line, like a terminal."""
         with self._lock:
-            parts = re.split(r"\r\n|\n|\r", self._partial + text)
-            self._partial = parts.pop()[-LIVE_LINE_CHARS * 2:]
-            for ln in parts:
-                self._push(ln)
+            if self._held_cr:
+                text, self._held_cr = "\r" + text, False
+            if text.endswith("\r"):
+                text, self._held_cr = text[:-1], True
+            for part in re.split(r"(\r\n|\n|\r)", text):
+                if part in ("\n", "\r\n"):
+                    self._push(self._partial)
+                    self._partial = ""
+                elif part == "\r":
+                    self._partial = ""
+                else:
+                    self._partial = (self._partial + part)[:LIVE_LINE_CHARS]
 
     def marker(self, text):
         with self._lock:
+            self._held_cr = False
             if self._partial:
                 self._push(self._partial)
                 self._partial = ""
@@ -89,10 +103,12 @@ class OutputBuffer:
 
     def finish(self):
         with self._lock:
+            self._held_cr = False
             if self._partial:
                 self._push(self._partial)
                 self._partial = ""
             self.finished = True
+            self.finished_at = time.time()
 
     def tail(self, n=LIVE_TAIL):
         with self._lock:
@@ -151,24 +167,51 @@ def _kill_group(p):
             pass
 
 
-def _pump(outf, pos, sink):
-    """Feed output written since `pos` to the sink; returns the new position. pread does not
-    move the file offset the child is writing at."""
-    while True:
+PUMP_BYTES = 1_000_000  # most one pass reads
+PUMP_SECONDS = 0.2  # longest one pass runs
+PUMP_LAG = 256 * 1024  # if the reader falls this far behind, skip ahead
+MAX_OUTPUT_FILE = 200_000_000  # a command that writes more than this is stopped
+
+
+def _skip_continuation(outf, pos, size):
+    """First position at or after pos that is not a UTF-8 continuation byte."""
+    while pos < size:
+        b = os.pread(outf.fileno(), 1, pos)
+        if not b or (b[0] & 0xC0) != 0x80:
+            break
+        pos += 1
+    return pos
+
+
+def _pump(outf, pos, sink, dec):
+    """Feed output written since `pos` to the sink and return the new position. One pass is
+    capped (about 1 MB or 0.2 s), and a reader more than PUMP_LAG behind jumps ahead, so a
+    command that prints faster than we read cannot keep us here. pread does not move the file
+    offset the child is writing at."""
+    size = os.fstat(outf.fileno()).st_size
+    if size - pos > PUMP_LAG:
+        pos = _skip_continuation(outf, size - PUMP_LAG, size)
+        dec.reset()
+        sink.feed("\n")
+    t0, used = time.monotonic(), 0
+    while used < PUMP_BYTES and time.monotonic() - t0 < PUMP_SECONDS:
         chunk = os.pread(outf.fileno(), 65536, pos)
         if not chunk:
-            return pos
+            break
         pos += len(chunk)
-        sink.feed(chunk.decode("utf-8", "replace"))
+        used += len(chunk)
+        sink.feed(dec.decode(chunk))
+    return pos
 
 
 def run_command(argv, cwd=None, timeout=CMD_TIMEOUT, shell=False, env=None):
     """Run one command in its own process group, return (returncode, combined output).
-    On timeout the whole group is killed and (124, "command timed out") comes back.
-    If this thread has a live-output sink, output is passed to it while the command runs.
-    Never raises."""
+    On timeout the whole group is killed and (124, "command timed out") comes back. A command
+    that writes more than MAX_OUTPUT_FILE bytes is stopped too (125). If this thread has a
+    live-output sink, output is passed to it while the command runs. Never raises."""
     p = None
     sink = getattr(_ctx, "sink", None)
+    dec = codecs.getincrementaldecoder("utf-8")("replace")
     try:
         full_env = {**os.environ, **(env or {})}
         # Output goes to a temp file, not a pipe: a background process that outlives the
@@ -179,23 +222,35 @@ def run_command(argv, cwd=None, timeout=CMD_TIMEOUT, shell=False, env=None):
                                  stdin=subprocess.DEVNULL, env=full_env, start_new_session=True)
             end = time.monotonic() + max(0.01, timeout)
             pos = 0
+            killed = None
             while True:
                 left = end - time.monotonic()
+                if left <= 0:
+                    killed = (124, "command timed out")
+                    break
                 try:
-                    p.wait(timeout=max(0.01, min(0.3 if sink else left, left)))
+                    p.wait(timeout=min(0.2, left))
                     break
                 except subprocess.TimeoutExpired:
-                    if sink:
-                        pos = _pump(outf, pos, sink)
-                    if time.monotonic() >= end - 0.005:
-                        _kill_group(p)
-                        if sink:
-                            _pump(outf, pos, sink)
-                        return 124, "command timed out"
+                    pass
+                if sink:
+                    pos = _pump(outf, pos, sink, dec)
+                if os.fstat(outf.fileno()).st_size > MAX_OUTPUT_FILE:
+                    killed = (125, "command printed too much output and was stopped")
+                    break
+            if killed:
+                _kill_group(p)
             if sink:
-                _pump(outf, pos, sink)
+                _pump(outf, pos, sink, dec)  # one last bounded pass
+                tail = dec.decode(b"", final=True)
+                if tail:
+                    sink.feed(tail)
+            if killed:
+                return killed
             size = os.fstat(outf.fileno()).st_size
             start = max(0, size - MAX_RESULT_BYTES)  # bounded, even for runaway output
+            if start:
+                start = _skip_continuation(outf, start, size)
             data = os.pread(outf.fileno(), size - start, start)
             return p.returncode, data.decode("utf-8", "replace").strip()
     except FileNotFoundError as e:
@@ -945,6 +1000,7 @@ class Updater:
                               "can_apply": self._applicable(c) and applying != bid and reason is None,
                               "reason": reason, "applying": applying == bid, "steps": steps,
                               "output_tail": self._out[bid].tail() if bid in self._out else "",
+                              "output_at": self._out[bid].finished_at if bid in self._out else None,
                               "progress": progress_text(steps) if steps else ""})
             return {"checking": checking, "applying": applying, "items": items}
 

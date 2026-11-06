@@ -503,9 +503,11 @@ function restoreScroll(pre, id) {
   const st = outState[id]; if (!st) return;
   pre.scrollTop = st.stick ? pre.scrollHeight : st.top;
 }
-// The text of a row's Output box: the live tail of the latest update, else a multi-line check result.
+// The text of a row's Output box: the live tail while an update runs, and after it ends only until the
+// row is checked again (output_at is when the update finished); otherwise a multi-line check result.
 function outText(it) {
-  if (it.output_tail) return it.output_tail;
+  const fresh = it.applying || (it.output_at && (it.checked_at || 0) <= it.output_at + 2);
+  if (it.output_tail && fresh) return it.output_tail;
   return String(it.detail || "").includes("\n") ? String(it.detail) : "";
 }
 function buildUpdRow(it) {
@@ -552,7 +554,7 @@ async function pollUpdates() {
   clearTimeout(updTimer);
   let ok = true;
   try { const r = await fetch("/api/updates"); if (!r.ok) throw new Error(r.status); upd = await r.json(); renderUpdates(); } catch { ok = false; }
-  updTimer = setTimeout(pollUpdates, upd.applying ? 1500 : (updOpen || upd.checking) ? 3000 : 60000);
+  updTimer = setTimeout(pollUpdates, updOpen ? (upd.applying ? 1500 : 3000) : (upd.applying || upd.checking) ? 3000 : 60000);
   return ok;
 }
 let updReturn = null;
