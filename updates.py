@@ -284,7 +284,7 @@ def fetch_json(url, timeout=20):
 def parse_version(text):
     """First version number in text as a tuple of ints, or None."""
     m = _VERSION_RE.search(text or "")
-    return tuple(int(x) for x in m.group(0).split(".")) if m else None
+    return _numbers(m.group(0)) if m else None
 
 
 def fmt_version(t):
@@ -355,27 +355,42 @@ def decide_git(behind, min_behind=1):
 
 RELEASE_LEVELS = {"patch": 0, "minor": 1, "major": 2}
 _RELEASE_RE = re.compile(r"v?(\d+(?:\.\d+)+)(-[0-9A-Za-z][0-9A-Za-z.-]*)?")
+# -rc1, -beta.2, -alpha, -pre1, -dev mark a pre-release; other suffixes (-cuda, -r2) do not
+_PRERELEASE_RE = re.compile(r"-(?:rc|alpha|beta|pre|dev)[0-9.]*(?:-|$)", re.I)
+MAX_COMPONENT_DIGITS = 9
 
 
 def release_threshold(u):
     """"min_release" of a github_release update object: patch, minor or major (default patch)."""
     v = u.get("min_release", "patch")
-    if v not in RELEASE_LEVELS:
+    if not isinstance(v, str) or v not in RELEASE_LEVELS:
         raise ValueError('"min_release" in backends.json must be "patch", "minor" or "major"')
     return v
 
 
+def _numbers(text):
+    """The numbers of a dotted version as a tuple, or None if a part is absurdly long."""
+    parts = text.split(".")
+    if any(len(p) > MAX_COMPONENT_DIGITS for p in parts):
+        return None
+    return tuple(int(p) for p in parts)
+
+
 def parse_release(text):
-    """(numbers, is_prerelease) for the first version in text, or None. A suffix such as -rc1
-    marks a pre-release; build metadata after + is ignored."""
-    m = _RELEASE_RE.search(text or "")
+    """(numbers, is_prerelease) for the first version in text, or None (also for absurdly
+    long numbers). Only a suffix such as -rc1, -beta.2, -alpha, -pre or -dev marks a
+    pre-release; other suffixes like -cuda do not. Build metadata after + is ignored."""
+    m = _RELEASE_RE.search(str(text) if text is not None else "")
     if not m:
         return None
-    return tuple(int(x) for x in m.group(1).split(".")), bool(m.group(2))
+    nums = _numbers(m.group(1))
+    if nums is None:
+        return None
+    return nums, bool(m.group(2) and _PRERELEASE_RE.match(m.group(2)))
 
 
 def release_class(old, new):
-    """Which part of the version changed: major, minor or patch (None if it cannot be told)."""
+    """Which part of the version changed: "major", "minor" or "patch". Missing parts count as 0."""
     a, b = (tuple(old) + (0, 0, 0))[:3], (tuple(new) + (0, 0, 0))[:3]
     if b[0] != a[0]:
         return "major"
@@ -384,9 +399,17 @@ def release_class(old, new):
     return "patch"
 
 
+def _strip_zeros(nums):
+    """1.2.3.0 equals 1.2.3: drop trailing zero parts before comparing."""
+    n = list(nums)
+    while len(n) > 1 and n[-1] == 0:
+        n.pop()
+    return tuple(n)
+
+
 def decide_release(installed_text, tag_text, min_release="patch"):
     """Status for a GitHub release check. A pre-release tag is never offered; text that does not
-    parse is ignored; if the size of the jump cannot be told, the update is simply offered."""
+    parse is ignored (unknown)."""
     lat = parse_release(tag_text)
     if lat is None:
         return UNKNOWN, "could not read the latest version"
@@ -395,13 +418,12 @@ def decide_release(installed_text, tag_text, min_release="patch"):
     inst = parse_release(installed_text)
     if inst is None:
         return UNKNOWN, f"latest is {fmt_version(lat[0])}; installed version not readable"
-    pad = lambda v: (tuple(v[0]) + (0, 0, 0))[:max(3, len(v[0]))]  # noqa: E731
     # a final release is newer than its own release candidates
-    if (pad(lat), 1) <= (pad(inst), 0 if inst[1] else 1):
+    if (_strip_zeros(lat[0]), 1) <= (_strip_zeros(inst[0]), 0 if inst[1] else 1):
         return UP_TO_DATE, f"version {fmt_version(inst[0])}"
     text = f"{fmt_version(inst[0])} to {fmt_version(lat[0])}"
     cls = release_class(inst[0], lat[0])
-    if cls is None or RELEASE_LEVELS[cls] >= RELEASE_LEVELS[min_release]:
+    if RELEASE_LEVELS[cls] >= RELEASE_LEVELS[min_release]:
         return AVAILABLE, text
     return NEWER, f"{text} ({cls} release, below the {min_release} threshold)"
 
@@ -510,8 +532,13 @@ def check_github_release(u, meta=None):
     dl = getattr(_ctx, "deadline", None)
     if dl is not None and dl - time.monotonic() <= 0:
         return ERROR, "check timed out"  # run_check rewrites this with the budget
-    tag = fetch_json(f"https://api.github.com/repos/{repo}/releases/latest").get("tag_name", "")
-    meta.update(installed=installed, latest=parse_version(tag))
+    data = fetch_json(f"https://api.github.com/repos/{repo}/releases/latest")
+    raw = data.get("tag_name") if isinstance(data, dict) else None
+    if raw is None or isinstance(raw, (dict, list, bool)) or not str(raw).strip():
+        return UNKNOWN, "GitHub did not return a release tag"
+    tag = str(raw).strip()  # a number such as 1.5 becomes "1.5"
+    lat = parse_release(tag)
+    meta.update(installed=installed, latest=lat[0] if lat else None)
     return decide_release(out if rc == 0 else "", tag, min_release)
 
 

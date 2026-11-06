@@ -810,6 +810,61 @@ class Thresholds(Patched):
         self.assertEqual(up.parse_release("v0.40.15-rc1"), ((0, 40, 15), True))
         self.assertEqual(up.parse_release("Warning: x\nclient version is 0.40.15"), ((0, 40, 15), False))
 
+    def test_release_setting_of_the_wrong_type_is_a_settings_error(self):
+        for bad in ([], ["minor"], 3, None, {"a": 1}, True):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                up.release_threshold({"min_release": bad})
+            b = backends()["rel"]
+            b["update"]["min_release"] = bad
+            self.patch(FakeRun([("tool --version", (0, "0.1.0"))]), lambda url: {"tag_name": "9.9.9"})
+            status, detail = up.run_check(b)
+            self.assertEqual(status, up.ERROR, repr(bad))
+            self.assertIn("min_release", detail)
+            self.assertIn("Bad settings", detail)
+
+    def test_only_real_prerelease_suffixes_count_as_prereleases(self):
+        for text, pre in (("0.40.14-cuda", False), ("0.40.14-r2", False), ("0.40.14-rocm", False),
+                          ("0.40.14-rc1", True), ("0.40.14-RC.2", True), ("0.40.14-beta.3", True),
+                          ("0.40.14-alpha", True), ("0.40.14-pre1", True), ("0.40.14-dev", True),
+                          ("0.40.14-rc1-cuda", True), ("0.40.14", False)):
+            self.assertEqual(up.parse_release(text), ((0, 40, 14), pre), text)
+        self.assertEqual(up.decide_release("0.40.14-cuda", "v0.40.14", "patch"), (up.UP_TO_DATE, "version 0.40.14"))
+        self.assertEqual(up.decide_release("0.40.14-cuda", "v0.40.15", "patch")[0], up.AVAILABLE)
+
+    def test_trailing_zero_parts_do_not_matter(self):
+        self.assertEqual(up.decide_release("1.2.3.0", "1.2.3", "patch")[0], up.UP_TO_DATE)
+        self.assertEqual(up.decide_release("1.2.3", "1.2.3.0", "patch")[0], up.UP_TO_DATE)
+        self.assertEqual(up.decide_release("1.2", "1.2.0.0", "patch")[0], up.UP_TO_DATE)
+        self.assertEqual(up.decide_release("1.2.3.0", "1.2.3.1", "minor")[0], up.NEWER)
+        self.assertEqual(up.decide_release("1.2.3", "1.3", "minor")[0], up.AVAILABLE)
+
+    def test_absurdly_long_numbers_are_ignored_not_a_crash(self):
+        huge = "1." + "9" * 5000
+        self.assertIsNone(up.parse_release(huge))
+        self.assertIsNone(up.parse_version(huge))
+        self.assertEqual(up.decide_release("0.1.0", huge, "patch")[0], up.UNKNOWN)
+        self.assertEqual(up.decide_release(huge, "0.1.0", "patch")[0], up.UNKNOWN)
+        self.assertEqual(up.decide_release("999999999.0.0", "999999999.0.1", "patch")[0], up.AVAILABLE)
+        self.patch(FakeRun([("tool --version", (0, "tool 0.1.0"))]), lambda url: {"tag_name": huge})
+        self.assertEqual(up.run_check(backends()["rel"])[0], up.UNKNOWN)
+
+    def test_a_tag_name_that_is_not_a_string(self):
+        r = backends()["rel"]
+        self.patch(FakeRun([("tool --version", (0, "tool version is 1.4.0"))]))
+        for answer, expected in (({"tag_name": 1.5}, up.AVAILABLE),  # a number becomes "1.5"
+                                 ({"tag_name": None}, up.UNKNOWN), ({"tag_name": ""}, up.UNKNOWN),
+                                 ({"tag_name": "  "}, up.UNKNOWN), ({"tag_name": ["1.9"]}, up.UNKNOWN),
+                                 ({"tag_name": {"x": 1}}, up.UNKNOWN), ({"tag_name": True}, up.UNKNOWN),
+                                 ({}, up.UNKNOWN), (["1.9"], up.UNKNOWN), (None, up.UNKNOWN)):
+            up.fetch_json = lambda url, a=answer: a
+            status, detail = up.run_check(r)
+            if answer == {"tag_name": 1.5}:
+                self.assertEqual(status, up.AVAILABLE, detail)
+                self.assertEqual(detail, "1.4.0 to 1.5")
+            else:
+                self.assertEqual(status, expected, (answer, detail))
+                self.assertIn("did not return a release tag", detail)
+
     def test_check_end_to_end_for_both_kinds(self):
         b = backends()["git"]
         b["update"]["min_commits_behind"] = 50
