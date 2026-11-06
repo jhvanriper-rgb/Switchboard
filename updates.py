@@ -19,7 +19,9 @@ import threading
 import time
 import urllib.request
 
-CHECK_TIMEOUT = 60  # seconds per entry
+CHECK_TIMEOUT = 60  # seconds per entry (git, pip, github_release)
+DOCKER_CHECK_TIMEOUT = 1800  # docker pull of a multi-GB image is slow
+DOWNLOADING = "Downloading the image: this can take several minutes."
 CMD_TIMEOUT = 55  # seconds for one command inside a check
 APPLY_TIMEOUT = 3600
 POST_TIMEOUT = 7200
@@ -272,7 +274,7 @@ def check_github_release(u, meta=None):
     installed = parse_version(out) if rc == 0 else None
     dl = getattr(_ctx, "deadline", None)
     if dl is not None and dl - time.monotonic() <= 0:
-        return ERROR, "check timed out"
+        return ERROR, "check timed out"  # run_check rewrites this with the budget
     tag = fetch_json(f"https://api.github.com/repos/{repo}/releases/latest").get("tag_name", "")
     meta.update(installed=installed, latest=parse_version(tag))
     return decide_version(installed, parse_version(tag))
@@ -283,7 +285,7 @@ def check_docker(u, b, meta=None):
     image, container = u.get("image"), b.get("container")
     if not image or not container:
         return ERROR, 'docker update needs "image" and a "container" on the entry'
-    rc, out = _cmd(["docker", "pull", image])
+    rc, out = _cmd(["docker", "pull", image], timeout=APPLY_TIMEOUT)  # the check's deadline is the real limit
     if rc != 0:
         return ERROR, "docker pull failed: " + tail_lines(out, 3)
     rc, new_id = _cmd(["docker", "image", "inspect", "--format", "{{.Id}}", image])
@@ -292,6 +294,25 @@ def check_docker(u, b, meta=None):
     if rc2 != 0 and not NO_SUCH.search(cid or ""):
         return ERROR, "could not inspect the container: " + last_line(cid)
     return decide_image(meta["new_id"], cid.strip() if rc2 == 0 else "")
+
+
+def check_budget(b, override=None):
+    """Seconds one check of this entry may take: the update object's "check_timeout", else
+    `override` (tests), else 1800 for docker and 60 for everything else."""
+    u = b.get("update") or {}
+    try:
+        v = float(u["check_timeout"])
+        if v > 0:
+            return v
+    except (KeyError, TypeError, ValueError):
+        pass
+    if override is not None:
+        return override
+    return DOCKER_CHECK_TIMEOUT if u.get("kind") == "docker" else CHECK_TIMEOUT
+
+
+def timed_out_text(budget):
+    return f"check timed out after {budget:g} seconds. Raise check_timeout in backends.json."
 
 
 def run_check(b, meta=None, budget=CHECK_TIMEOUT):
@@ -318,7 +339,7 @@ def run_check(b, meta=None, budget=CHECK_TIMEOUT):
     finally:
         _ctx.deadline = None
     if res[0] == ERROR and time.monotonic() >= deadline:
-        return ERROR, "check timed out"
+        return ERROR, timed_out_text(budget)
     return res
 
 
@@ -575,7 +596,7 @@ def precheck_apply(b):
 
 
 # ---------- the cache and the background work ----------
-def _with_timeout(fn, seconds):
+def _with_timeout(fn, seconds, message="check timed out"):
     box = {}
 
     def work():
@@ -587,7 +608,7 @@ def _with_timeout(fn, seconds):
     t = threading.Thread(target=work, daemon=True)
     t.start()
     t.join(seconds)
-    return box.get("r") if "r" in box else (ERROR, "check timed out")
+    return box.get("r") if "r" in box else (ERROR, message)
 
 
 def progress_text(steps):
@@ -596,11 +617,11 @@ def progress_text(steps):
 
 
 class Updater:
-    def __init__(self, get_backends, is_running=lambda bid: False, log_writer=None, check_timeout=CHECK_TIMEOUT):
+    def __init__(self, get_backends, is_running=lambda bid: False, log_writer=None, check_timeout=None):
         self._get = get_backends
         self._is_running = is_running
         self._log = log_writer
-        self._timeout = check_timeout
+        self._timeout = check_timeout  # overrides the kind defaults (tests); None = use them
         self._lock = threading.RLock()
         self._cache = {}  # id -> status, detail, checked_at, meta, steps, incomplete
         self._checking = False
@@ -677,9 +698,16 @@ class Updater:
             if bid not in self._cache:
                 self._cache[bid] = {"status": CHECKING, "detail": "", "checked_at": None, "meta": {}, "steps": []}
         meta = {}
-        status, detail = _with_timeout(lambda: run_check(b, meta, self._timeout), self._timeout + 5)
+        budget = check_budget(b, self._timeout)
+        with self._lock:
+            before = dict(self._cache.get(bid) or {})
+            if b["update"].get("kind") == "docker":  # the pull can take minutes: say so, not "error"
+                self._cache[bid] = {**before, "status": CHECKING, "detail": DOWNLOADING}
+        status, detail = _with_timeout(lambda: run_check(b, meta, budget), budget + 5, timed_out_text(budget))
         with self._lock:
             if self._applying is not None or self._epoch != epoch:
+                if before:
+                    self._cache[bid] = before
                 return  # an update ran meanwhile; this result may be stale
             old = self._cache.get(bid) or {}
             inc = old.get("incomplete")
@@ -780,7 +808,7 @@ class Updater:
                 inc = old.get("incomplete")
             try:
                 if not meta:
-                    run_check(b, meta, self._timeout)  # read-only; fills in what verify compares with
+                    run_check(b, meta, check_budget(b, self._timeout))  # read-only; fills in what verify compares with
                 steps = build_steps(b, meta)
             except Exception as e:  # noqa: BLE001
                 self._store(bid, ERROR, f"Could not start the update: {e}")
@@ -807,7 +835,8 @@ class Updater:
                                 incomplete={"step": name, "reason": reason})
                 return
             meta2 = {}
-            status, detail = _with_timeout(lambda: run_check(b, meta2, self._timeout), self._timeout + 5)
+            budget = check_budget(b, self._timeout)
+            status, detail = _with_timeout(lambda: run_check(b, meta2, budget), budget + 5, timed_out_text(budget))
             done = f"Updated and verified ({progress_text(prog)})."
             if status == ERROR:  # the update itself passed verify; only the recheck failed
                 status = UP_TO_DATE

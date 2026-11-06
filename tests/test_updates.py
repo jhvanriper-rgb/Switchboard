@@ -170,7 +170,8 @@ class Checks(Patched):
         self.assertTrue(all(t is not None and t <= 30 for t in calls))
         # an already-spent budget runs nothing at all
         calls.clear()
-        self.assertEqual(up.run_check(backends()["pip"], budget=0), (up.ERROR, "check timed out"))
+        self.assertEqual(up.run_check(backends()["pip"], budget=0),
+                         (up.ERROR, "check timed out after 0 seconds. Raise check_timeout in backends.json."))
         self.assertEqual(calls, [])
 
     def test_hung_check_times_out(self):
@@ -181,6 +182,83 @@ class Checks(Patched):
             gate.wait(5)
             return up.UP_TO_DATE, "late"
         self.assertEqual(up._with_timeout(lambda: slow({}), 0.05), (up.ERROR, "check timed out"))
+
+
+class CheckBudget(Patched):
+    def test_defaults_and_per_entry_override(self):
+        bk = backends()
+        self.assertEqual(up.check_budget(bk["git"]), 60)
+        self.assertEqual(up.check_budget(bk["pip"]), 60)
+        self.assertEqual(up.check_budget(bk["rel"]), 60)
+        self.assertEqual(up.check_budget(bk["dock"]), 1800)
+        bk["dock"]["update"]["check_timeout"] = 3600
+        bk["git"]["update"]["check_timeout"] = 5
+        self.assertEqual(up.check_budget(bk["dock"]), 3600)
+        self.assertEqual(up.check_budget(bk["git"]), 5)
+        bk["git"]["update"]["check_timeout"] = "junk"
+        self.assertEqual(up.check_budget(bk["git"]), 60)
+
+    def test_the_entrys_budget_is_the_shared_deadline(self):
+        seen = []
+
+        def fake(argv, **kw):
+            seen.append(kw.get("timeout"))
+            return 0, "sha256:x"
+        self.patch(fake)
+        bk = backends()
+        up.run_check(bk["dock"], budget=up.check_budget(bk["dock"]))
+        self.assertTrue(all(t <= 1800 for t in seen), seen)
+        self.assertTrue(any(t > 1700 for t in seen), seen)  # the pull may use the whole budget
+
+    def test_docker_row_says_downloading_and_other_rows_finish_meanwhile(self):
+        import time
+        in_pull, gate = threading.Event(), threading.Event()
+        self.addCleanup(gate.set)
+
+        def fake(argv, **kw):
+            text = " ".join(argv)
+            if "docker pull" in text:
+                in_pull.set()
+                gate.wait(10)
+            return 0, ""
+        self.patch(fake, lambda url: {"tag_name": "1.0.0"})
+        u = up.Updater(lambda: backends(), lambda bid: False)
+        self.assertEqual(u.check_all_async()[0], 202)
+        self.assertTrue(in_pull.wait(5))
+        t0 = time.monotonic()
+        snap = u.snapshot()
+        self.assertLess(time.monotonic() - t0, 1)  # the panel is not blocked by the pull
+        rows = {i["id"]: i for i in snap["items"]}
+        self.assertTrue(snap["checking"])
+        for bid in ("git", "pip", "rel"):
+            self.assertIsNotNone(rows[bid]["checked_at"], bid)
+            self.assertNotEqual(rows[bid]["status"], up.CHECKING, bid)
+        self.assertEqual(rows["dock"]["status"], up.CHECKING)
+        self.assertEqual(rows["dock"]["detail"], "Downloading the image: this can take several minutes.")
+        gate.set()
+        for _ in range(100):
+            if not u.snapshot()["checking"]:
+                break
+            time.sleep(0.05)
+        done = next(i for i in u.snapshot()["items"] if i["id"] == "dock")
+        self.assertNotEqual(done["status"], up.CHECKING)
+        self.assertNotEqual(done["detail"], up.DOWNLOADING)
+
+    def test_a_real_docker_timeout_is_an_error_with_advice(self):
+        bk = backends()
+        bk["dock"]["update"]["check_timeout"] = 0.05
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+
+        def fake(argv, **kw):
+            gate.wait(2)
+            return 124, "command timed out"
+        self.patch(fake)
+        u = up.Updater(lambda: bk, lambda bid: False)
+        u._check_one("dock")
+        row = next(i for i in u.snapshot()["items"] if i["id"] == "dock")
+        self.assertEqual(row["status"], up.ERROR)
+        self.assertEqual(row["detail"], "check timed out after 0.05 seconds. Raise check_timeout in backends.json.")
 
 
 class StepRunner(Patched):

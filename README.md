@@ -30,6 +30,8 @@ Edit `backends.json`. Each entry has an `id`, `name`, `group`, and a `kind` of `
 
 Add an optional `update` object to any backend in `backends.json`. Backends without one do not appear in the Updates panel. Checks are read-only for the running software (`git fetch` and `docker pull` only download). Each check has a 60 second limit and shows "check timed out" if it hangs.
 
+Any update object may set `"check_timeout": <seconds>`, the most one check (all of its commands together) may take. The default is 60 for `git`, `pip` and `github_release`, and 1800 for `docker`. A check that runs out reports "error: check timed out after N seconds. Raise check_timeout in backends.json."
+
 Kinds:
 
 - `{"kind": "git", "path": "/dir", "branch": "optional"}`. Check: `git fetch`, then count commits behind the upstream. A folder that is not a git checkout shows "no update source". Optional keys: `python` (a venv's python; if the repo has a `requirements.txt` it is installed with it), `post_command` (runs after a successful pull, in `post_cwd` or the repo; `post_shell: true` for pipes), `verify_command` (must exit 0 after the update).
@@ -39,7 +41,7 @@ Kinds:
       "update": {"kind": "github_release", "repo": "ollama/ollama", "version_command": "ollama --version",
                  "apply_command": "curl -fsSL https://ollama.com/install.sh | sh", "shell": true,
                  "update_while_running": true}
-- `{"kind": "docker", "image": "repo/name:tag", "apply_command": "..."}`. Check: `docker pull` (the running container is untouched), then compare image ids. `apply_command` is the command you supply to recreate the container; without it the Update button stays disabled and says "No recreate command set in backends.json." `docker pull` downloads the whole image, so the checked-in Open WebUI entry sets `"check_at_startup": false`: it is checked only when you press Check again.
+- `{"kind": "docker", "image": "repo/name:tag", "apply_command": "..."}`. Check: `docker pull` (the running container is untouched), then compare image ids. `apply_command` is the command you supply to recreate the container; without it the Update button stays disabled and says "No recreate command set in backends.json." `docker pull` downloads the whole image, so the checked-in Open WebUI entry sets `"check_at_startup": false`: it is checked only when you press Check again. While the pull runs the row shows "checking" with "Downloading the image: this can take several minutes." and the other rows keep working.
 
 Each update is a pipeline of steps run in order, stopping at the first failure: **pull** (get the new version), **install** (make it usable), **verify** (prove it works). The panel shows progress live ("pull ok · install running"). Defaults per kind:
 
