@@ -2,7 +2,9 @@
 GitHub lookup are replaced with fakes. Run: python3 -m unittest discover -s tests -v
 """
 import json
+import os
 import socket
+import tempfile as tempfile_module
 import sys
 import threading
 import unittest
@@ -517,6 +519,237 @@ class GpuCheck(Patched):
         self.assertIsNone(up.parse_gpu_check({"kind": "git"}))
 
 
+class LiveOutput(Patched):
+    def test_buffer_keeps_only_the_last_200_lines(self):
+        b = up.OutputBuffer()
+        b.feed("".join(f"line {n}\n" for n in range(1000)))
+        self.assertEqual(b.line_count(), 200)
+        self.assertEqual(b.tail().splitlines()[-1], "line 999")
+        self.assertEqual(len(b.tail().splitlines()), 60)  # the API tail
+        self.assertEqual(b.tail(500).splitlines()[0], "line 800")
+
+    def test_chunks_that_split_a_line_are_joined(self):
+        b = up.OutputBuffer()
+        b.feed("hel")
+        b.feed("lo\nwor")
+        b.feed("ld\nrest")
+        self.assertEqual(b.tail().splitlines(), ["hello", "world", "rest"])
+        b.finish()
+        self.assertTrue(b.finished)
+        self.assertIsNotNone(b.finished_at)
+        self.assertEqual(b.tail().splitlines()[-1], "rest")
+
+    def test_a_bare_carriage_return_replaces_the_line_like_a_progress_bar(self):
+        b = up.OutputBuffer()
+        b.feed("start\n10%\r20%\r30%\r")
+        self.assertEqual(b.line_count(), 1)  # only \n stores a line
+        self.assertEqual(b.tail().splitlines(), ["start", "30%"])
+        b.feed("40%\r")
+        b.feed("done\n")
+        self.assertEqual(b.tail().splitlines(), ["start", "done"])
+
+    def test_crlf_split_across_chunks_adds_no_blank_line(self):
+        b = up.OutputBuffer()
+        b.feed("one\r")
+        b.feed("\ntwo\r\n")
+        b.feed("three\r")
+        b.feed("\n")
+        self.assertEqual(b.tail().splitlines(), ["one", "two", "three"])
+        self.assertEqual(b.line_count(), 3)
+
+    def test_multibyte_character_split_between_reads_is_whole(self):
+        b = up.OutputBuffer()
+        import codecs
+        dec = codecs.getincrementaldecoder("utf-8")("replace")
+        b.feed(dec.decode(b"caf\xc3"))
+        b.feed(dec.decode(b"\xa9\n"))
+        self.assertEqual(b.tail(), "caf\u00e9")
+
+    def test_a_real_command_printing_a_split_character_shows_it_whole(self):
+        b = up.OutputBuffer()
+        up._ctx.sink = b
+        try:
+            rc, out = up.run_command(["sh", "-c", "printf 'caf\\303'; sleep 0.8; printf '\\251\\n'"], timeout=10)
+        finally:
+            up._ctx.sink = None
+        self.assertEqual(rc, 0)
+        self.assertEqual(b.tail(), "caf\u00e9")
+        self.assertEqual(out, "caf\u00e9")
+
+    def test_a_command_that_prints_faster_than_we_read_still_times_out(self):
+        import time
+        from unittest import mock
+        made = []
+        real = tempfile_module.TemporaryFile
+
+        def spy(*a, **k):
+            f = real(*a, **k)
+            made.append(f)
+            return f
+        b = up.OutputBuffer()
+        up._ctx.sink = b
+        t0 = time.monotonic()
+        try:
+            with mock.patch.object(up.tempfile, "TemporaryFile", spy):
+                rc, out = up.run_command(["sh", "-c", "yes"], timeout=2)
+        finally:
+            up._ctx.sink = None
+        # 124 when the timeout fires first; 125 when it wrote past the output-size limit first
+        # (`yes` can write hundreds of MB per second). Either way it is stopped promptly.
+        self.assertIn(rc, (124, 125))
+        self.assertLess(time.monotonic() - t0, 6)
+        self.assertTrue(made and all(f.closed for f in made), "the temp file must be closed (and so removed)")
+        self.assertLessEqual(b.line_count(), up.LIVE_LINES)
+
+    def test_a_chatty_but_slow_command_times_out_with_124(self):
+        import time
+        b = up.OutputBuffer()
+        up._ctx.sink = b
+        t0 = time.monotonic()
+        try:
+            rc, out = up.run_command(["sh", "-c", "while :; do echo tick; sleep 0.01; done"], timeout=1)
+        finally:
+            up._ctx.sink = None
+        self.assertEqual((rc, out), (124, "command timed out"))
+        self.assertLess(time.monotonic() - t0, 5)
+        self.assertIn("tick", b.tail())
+
+    def test_catching_up_skips_ahead_and_never_starts_inside_a_character(self):
+        import codecs
+        with tempfile_module.TemporaryFile() as f:
+            f.write(b"x" * (up.PUMP_LAG * 3) + "\u00e9".encode() * 10)
+            f.flush()
+            b = up.OutputBuffer()
+            dec = codecs.getincrementaldecoder("utf-8")("replace")
+            pos = up._pump(f, 0, b, dec)
+            self.assertEqual(pos, os.fstat(f.fileno()).st_size)
+            self.assertNotIn("\ufffd", b.tail())
+            # a position inside a multi-byte character is moved past it
+            self.assertEqual(up._skip_continuation(f, up.PUMP_LAG * 3 + 1, pos), up.PUMP_LAG * 3 + 2)
+
+    def test_every_step_gets_a_marker_in_order(self):
+        b = up.OutputBuffer()
+        steps = [up.Step("pull", lambda: (True, "", "pulled")), up.Step("install", lambda: (True, "", "")),
+                 up.Step("verify", lambda: (False, "", "version mismatch"))]
+        up.run_steps(steps, out=b)
+        lines = b.tail().splitlines()
+        self.assertEqual(lines, ["== pull started ==", "== pull ok: pulled ==", "== install started ==",
+                                 "== install ok ==", "== verify started ==", "== verify failed: version mismatch =="])
+
+    def test_output_streams_while_the_command_is_still_running(self):
+        import time
+        b = up.OutputBuffer()
+        result = {}
+        step = up.cmd_step("install", ["sh", "-c", "echo first; sleep 2; echo second"], timeout=20)
+        th = threading.Thread(target=lambda: result.update(r=up.run_steps([step], out=b)))
+        th.start()
+        seen_early = False
+        for _ in range(30):
+            if "first" in b.tail() and th.is_alive():
+                seen_early = True
+                break
+            time.sleep(0.1)
+        th.join(20)
+        self.assertTrue(seen_early, "the first line should be visible before the command ends")
+        self.assertTrue(result["r"][0])
+        self.assertIn("second", b.tail())
+        self.assertEqual(result["r"][3].count("first"), 1)  # the final result is still complete
+
+    def test_timeout_still_kills_the_group_and_keeps_what_was_printed(self):
+        b = up.OutputBuffer()
+        up._ctx.sink = b
+        try:
+            rc, out = up.run_command(["sh", "-c", "echo hi; sleep 30 & sleep 30"], timeout=1)
+        finally:
+            up._ctx.sink = None
+        self.assertEqual((rc, out), (124, "command timed out"))
+        self.assertIn("hi", b.tail())
+
+    def test_hostile_output_is_capped_and_cleaned(self):
+        b = up.OutputBuffer()
+        b.feed("a" * 50000 + "\n")
+        b.feed("\x1b[31mred\x1b[0m \x00\x07bell\x1b]0;title\x07 ok\n")
+        b.feed("<script>alert(1)</script> <img src=x onerror=y>\n")
+        lines = b.tail().splitlines()
+        self.assertEqual(len(lines[0]), up.LIVE_LINE_CHARS)
+        self.assertEqual(lines[1], "red bell ok")
+        self.assertEqual(lines[2], "<script>alert(1)</script> <img src=x onerror=y>")  # kept as plain text
+        self.assertNotIn("\x1b", b.tail())
+        body = json.dumps({"output_tail": b.tail()})  # what the API sends: JSON-escaped text
+        self.assertEqual(json.loads(body)["output_tail"], b.tail())
+
+    def test_a_runaway_command_cannot_blow_up_memory(self):
+        b = up.OutputBuffer()
+        up._ctx.sink = b
+        try:
+            rc, out = up.run_command(["sh", "-c", "head -c 5000000 /dev/zero | tr '\\0' 'a'; echo done"], timeout=30)
+        finally:
+            up._ctx.sink = None
+        self.assertEqual(rc, 0)
+        self.assertLessEqual(len(out), up.MAX_RESULT_BYTES + 10)
+        self.assertLessEqual(b.line_count(), up.LIVE_LINES)
+        self.assertLessEqual(len(b.tail(1000)), up.LIVE_LINES * (up.LIVE_LINE_CHARS + 1))
+
+    def test_updater_exposes_the_tail_during_and_after_an_update_until_the_next_one(self):
+        gate, started = threading.Event(), threading.Event()
+        self.addCleanup(gate.set)
+
+        def fake(argv, **kw):
+            text = " ".join(argv)
+            if "install --upgrade" in text:
+                up.emit("Collecting pkg")  # what a streaming command would add
+                started.set()
+                gate.wait(5)
+                return 0, "ok"
+            if "pip show" in text:
+                return 0, "Version: 1.2.0"
+            return 0, "[]"
+        self.patch(fake)
+        bk = backends()
+        u = up.Updater(lambda: bk, lambda bid: False)
+        u._store("pip", up.AVAILABLE, "x", meta={"installed": (1, 0), "latest": (1, 2, 0)})
+        self.assertEqual(next(i for i in u.snapshot()["items"] if i["id"] == "pip")["output_tail"], "")
+        self.assertEqual(u.apply("pip")[0], 202)
+        self.assertTrue(started.wait(5))
+        row = next(i for i in u.snapshot()["items"] if i["id"] == "pip")
+        self.assertTrue(row["applying"])
+        self.assertIn("== pull started ==", row["output_tail"])
+        self.assertIn("Collecting pkg", row["output_tail"])
+        gate.set()
+        for _ in range(100):
+            if u.snapshot()["applying"] is None:
+                break
+            threading.Event().wait(0.05)
+        row = next(i for i in u.snapshot()["items"] if i["id"] == "pip")
+        self.assertFalse(row["applying"])
+        self.assertIn("== verify ok", row["output_tail"])
+        self.assertTrue(u._out["pip"].finished)
+        self.assertIsNone(next(i for i in u.snapshot()["items"] if i["id"] == "git")["output_at"])
+        self.assertIsNotNone(row["output_at"])
+        self.assertLessEqual(row["checked_at"], row["output_at"] + 2)  # so the page shows the live tail
+        # the next update starts with a fresh buffer
+        u._store("pip", up.AVAILABLE, "x", meta={"installed": (1, 0), "latest": (1, 2, 0)})
+        gate.clear()
+        u.apply("pip")
+        self.assertFalse(u._out["pip"].finished)  # a fresh buffer, not the old finished one
+        gate.set()
+        for _ in range(100):
+            if u.snapshot()["applying"] is None:
+                break
+            threading.Event().wait(0.05)
+
+    def test_the_page_shows_output_as_text_and_polls_fast_while_updating(self):
+        html = (Path(__file__).resolve().parent.parent / "static" / "index.html").read_text()
+        a = html.index("function outText")
+        b = html.index("async function pollUpdates")
+        a2 = html.index("function buildUpdRow")
+        section = html[a:b] + html[a2:html.index("\n}\n", a2)]
+        self.assertNotIn("innerHTML", section)
+        self.assertIn("pre.textContent = text", section)
+        self.assertRegex(html, r"updOpen \? \(upd\.applying \? 1500 : 3000\) : \(upd\.applying \|\| upd\.checking\) \? 3000 : 60000")
+        self.assertIn("output_at", html)
+
+
 class StepRunner(Patched):
     def steps(self, *specs):
         return [up.Step(n, lambda r=r: r) for n, r in specs]
@@ -821,7 +1054,7 @@ class HttpApi(Patched):
             data = json.loads(r.read())
         self.assertEqual(set(data), {"checking", "applying", "items"})
         self.assertEqual({i["id"] for i in data["items"]}, {"git", "pip", "rel", "dock"})
-        for key in ("id", "name", "status", "detail", "checked_at", "running", "can_apply"):
+        for key in ("id", "name", "status", "detail", "checked_at", "running", "can_apply", "output_tail"):
             self.assertIn(key, data["items"][0])
 
 

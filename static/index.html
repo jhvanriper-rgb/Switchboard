@@ -482,9 +482,14 @@ function renderUpdates() {
   const fresh = [];
   for (const it of upd.items) {
     // Rebuild a row only when its data changed; an untouched row keeps its open Output box and scroll position.
-    const sig = JSON.stringify([it.status, it.detail, it.running, it.can_apply, it.reason, it.applying, it.progress, it.checked_at, upd.checking, updBusyAll]);
+    const text = outText(it);
+    const sig = JSON.stringify([it.status, it.detail, it.running, it.can_apply, it.reason, it.applying, it.progress, it.checked_at, upd.checking, updBusyAll, !!text]);
     let r = updRows[it.id];
     if (!r || r.sig !== sig) { r = buildUpdRow(it); r.sig = sig; updRows[it.id] = r; fresh.push(r); }
+    if (r.pre && r.outText !== text) {  // live output: update the text in place, keep the box open and scrolled
+      r.pre.textContent = text; r.outText = text;
+      if (r.dt.open) restoreScroll(r.pre, it.id);
+    }
     r.ck.textContent = "Checked " + ago(it.checked_at) + (it.running ? " · running now" : "");  // the age moves on its own
     want.push(r.el);
   }
@@ -497,6 +502,13 @@ const updRows = {}, openOut = new Set(), outState = {};
 function restoreScroll(pre, id) {
   const st = outState[id]; if (!st) return;
   pre.scrollTop = st.stick ? pre.scrollHeight : st.top;
+}
+// The text of a row's Output box: the live tail while an update runs, and after it ends only until the
+// row is checked again (output_at is when the update finished); otherwise a multi-line check result.
+function outText(it) {
+  const fresh = it.applying || (it.output_at && (it.checked_at || 0) <= it.output_at + 2);
+  if (it.output_tail && fresh) return it.output_tail;
+  return String(it.detail || "").includes("\n") ? String(it.detail) : "";
 }
 function buildUpdRow(it) {
   const row = document.createElement("div"); row.className = "urow";
@@ -511,14 +523,17 @@ function buildUpdRow(it) {
   row.append(t, d);
   if (!it.applying && it.progress) { const p = document.createElement("div"); p.className = "ud"; p.textContent = it.progress; row.appendChild(p); }
   let dt = null, pre = null;
-  if (!it.applying && lines.length > 1) {
+  const text = outText(it);
+  if (text) {
     dt = document.createElement("details"); const sm = document.createElement("summary"); sm.textContent = "Output";
-    pre = document.createElement("pre"); pre.textContent = it.detail;  // text, never HTML
+    pre = document.createElement("pre"); pre.textContent = text;  // text, never HTML
     dt.append(sm, pre); row.appendChild(dt);
-    if (!outState[it.id]) outState[it.id] = {stick: it.status === "error", top: 0};
-    if (openOut.has(it.id)) dt.open = true;
+    const st = outState[it.id] || (outState[it.id] = {stick: it.status === "error" || it.applying, top: 0, closed: false, was: false});
+    if (it.applying && !st.was) { st.closed = false; st.stick = true; }  // a new update starts: open and follow it
+    st.was = !!it.applying;
+    if (openOut.has(it.id) || (it.applying && !st.closed)) dt.open = true;
     dt.addEventListener("toggle", () => {
-      if (dt.open) { openOut.add(it.id); restoreScroll(pre, it.id); } else openOut.delete(it.id);
+      if (dt.open) { openOut.add(it.id); st.closed = false; restoreScroll(pre, it.id); } else { openOut.delete(it.id); st.closed = true; }
     });
     pre.addEventListener("scroll", () => {
       const st = outState[it.id]; if (!st) return;
@@ -533,13 +548,13 @@ function buildUpdRow(it) {
     b.onclick = async () => { await post("/api/updates/apply/" + encodeURIComponent(it.id)); pollUpdates(); };
     row.appendChild(b);
   }
-  return {el: row, ck, dt, pre, id: it.id};
+  return {el: row, ck, dt, pre, id: it.id, outText: text};
 }
 async function pollUpdates() {
   clearTimeout(updTimer);
   let ok = true;
   try { const r = await fetch("/api/updates"); if (!r.ok) throw new Error(r.status); upd = await r.json(); renderUpdates(); } catch { ok = false; }
-  updTimer = setTimeout(pollUpdates, (updOpen || upd.checking || upd.applying) ? 3000 : 60000);
+  updTimer = setTimeout(pollUpdates, updOpen ? (upd.applying ? 1500 : 3000) : (upd.applying || upd.checking) ? 3000 : 60000);
   return ok;
 }
 let updReturn = null;

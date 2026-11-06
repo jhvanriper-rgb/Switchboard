@@ -8,6 +8,7 @@ only download). Updates are applied only when apply() is called for one id.
 All command execution goes through run_command() and all web lookups through fetch_json(),
 so tests can replace those two functions.
 """
+import codecs
 import json
 import math
 import os
@@ -44,6 +45,102 @@ _VERSION_RE = re.compile(r"\d+(?:\.\d+)+")
 
 
 # ---------- the two replaceable edges ----------
+LIVE_LINES = 200  # lines kept per backend
+LIVE_TAIL = 60  # lines the API returns
+LIVE_LINE_CHARS = 2000
+MAX_RESULT_BYTES = 2_000_000  # most of one command's output kept for the result
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?")
+_CTRL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+class OutputBuffer:
+    """The recent output of one backend's update: the last LIVE_LINES lines, plus a line
+    at the start of every step. Bounded: long lines are cut (the first LIVE_LINE_CHARS
+    characters are kept), control characters and terminal escape codes are removed, and old
+    lines fall off the front."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._lines = []
+        self._partial = ""  # the line being written; a bare \r starts it over (progress bars)
+        self._held_cr = False  # a trailing \r waits for the next chunk, which may begin with \n
+        self.finished = False
+        self.finished_at = None
+
+    @staticmethod
+    def _clean(line):
+        return _CTRL.sub("", _ANSI.sub("", line))[:LIVE_LINE_CHARS]
+
+    def _push(self, line):
+        self._lines.append(self._clean(line))
+        if len(self._lines) > LIVE_LINES:
+            del self._lines[:len(self._lines) - LIVE_LINES]
+
+    def feed(self, text):
+        """Add raw command output in any chunking. \\n (or \\r\\n) ends a line; a bare \\r
+        replaces the current line, like a terminal."""
+        with self._lock:
+            if self._held_cr:
+                text, self._held_cr = "\r" + text, False
+            if text.endswith("\r"):
+                text, self._held_cr = text[:-1], True
+            for part in re.split(r"(\r\n|\n|\r)", text):
+                if part in ("\n", "\r\n"):
+                    self._push(self._partial)
+                    self._partial = ""
+                elif part == "\r":
+                    self._partial = ""
+                else:
+                    self._partial = (self._partial + part)[:LIVE_LINE_CHARS]
+
+    def marker(self, text):
+        with self._lock:
+            self._held_cr = False
+            if self._partial:
+                self._push(self._partial)
+                self._partial = ""
+            self._push(text)
+
+    def finish(self):
+        with self._lock:
+            self._held_cr = False
+            if self._partial:
+                self._push(self._partial)
+                self._partial = ""
+            self.finished = True
+            self.finished_at = time.time()
+
+    def tail(self, n=LIVE_TAIL):
+        with self._lock:
+            lines = self._lines + ([self._clean(self._partial)] if self._partial else [])
+            return "\n".join(lines[-n:])
+
+    def line_count(self):
+        with self._lock:
+            return len(self._lines)
+
+
+_ctx = threading.local()  # per thread: shared check deadline, and the live output sink
+
+
+def emit(text):
+    """Add a line to the live output of the update running in this thread (if any)."""
+    sink = getattr(_ctx, "sink", None)
+    if sink is not None:
+        sink.marker(text)
+
+
+class _quiet:
+    """Keep repeated polling output (journal reads) out of the live output."""
+
+    def __enter__(self):
+        self.old = getattr(_ctx, "sink", None)
+        _ctx.sink = None
+
+    def __exit__(self, *a):
+        _ctx.sink = self.old
+
+
 def _kill_group(p):
     """Stop a command and everything it started: SIGTERM, a short wait, then SIGKILL."""
     try:
@@ -70,11 +167,51 @@ def _kill_group(p):
             pass
 
 
+PUMP_BYTES = 1_000_000  # most one pass reads
+PUMP_SECONDS = 0.2  # longest one pass runs
+PUMP_LAG = 256 * 1024  # if the reader falls this far behind, skip ahead
+MAX_OUTPUT_FILE = 200_000_000  # a command that writes more than this is stopped
+
+
+def _skip_continuation(outf, pos, size):
+    """First position at or after pos that is not a UTF-8 continuation byte."""
+    while pos < size:
+        b = os.pread(outf.fileno(), 1, pos)
+        if not b or (b[0] & 0xC0) != 0x80:
+            break
+        pos += 1
+    return pos
+
+
+def _pump(outf, pos, sink, dec):
+    """Feed output written since `pos` to the sink and return the new position. One pass is
+    capped (about 1 MB or 0.2 s), and a reader more than PUMP_LAG behind jumps ahead, so a
+    command that prints faster than we read cannot keep us here. pread does not move the file
+    offset the child is writing at."""
+    size = os.fstat(outf.fileno()).st_size
+    if size - pos > PUMP_LAG:
+        pos = _skip_continuation(outf, size - PUMP_LAG, size)
+        dec.reset()
+        sink.feed("\n")
+    t0, used = time.monotonic(), 0
+    while used < PUMP_BYTES and time.monotonic() - t0 < PUMP_SECONDS:
+        chunk = os.pread(outf.fileno(), 65536, pos)
+        if not chunk:
+            break
+        pos += len(chunk)
+        used += len(chunk)
+        sink.feed(dec.decode(chunk))
+    return pos
+
+
 def run_command(argv, cwd=None, timeout=CMD_TIMEOUT, shell=False, env=None):
     """Run one command in its own process group, return (returncode, combined output).
-    On timeout the whole group is killed and (124, "command timed out") comes back.
-    Never raises."""
+    On timeout the whole group is killed and (124, "command timed out") comes back. A command
+    that writes more than MAX_OUTPUT_FILE bytes is stopped too (125). If this thread has a
+    live-output sink, output is passed to it while the command runs. Never raises."""
     p = None
+    sink = getattr(_ctx, "sink", None)
+    dec = codecs.getincrementaldecoder("utf-8")("replace")
     try:
         full_env = {**os.environ, **(env or {})}
         # Output goes to a temp file, not a pipe: a background process that outlives the
@@ -83,22 +220,45 @@ def run_command(argv, cwd=None, timeout=CMD_TIMEOUT, shell=False, env=None):
         with tempfile.TemporaryFile() as outf:
             p = subprocess.Popen(argv, cwd=cwd, shell=shell, stdout=outf, stderr=subprocess.STDOUT,
                                  stdin=subprocess.DEVNULL, env=full_env, start_new_session=True)
-            try:
-                p.wait(timeout=max(0.01, timeout))
-            except subprocess.TimeoutExpired:
+            end = time.monotonic() + max(0.01, timeout)
+            pos = 0
+            killed = None
+            while True:
+                left = end - time.monotonic()
+                if left <= 0:
+                    killed = (124, "command timed out")
+                    break
+                try:
+                    p.wait(timeout=min(0.2, left))
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
+                if sink:
+                    pos = _pump(outf, pos, sink, dec)
+                if os.fstat(outf.fileno()).st_size > MAX_OUTPUT_FILE:
+                    killed = (125, "command printed too much output and was stopped")
+                    break
+            if killed:
                 _kill_group(p)
-                return 124, "command timed out"
-            outf.seek(0)
-            return p.returncode, outf.read().decode("utf-8", "replace").strip()
+            if sink:
+                _pump(outf, pos, sink, dec)  # one last bounded pass
+                tail = dec.decode(b"", final=True)
+                if tail:
+                    sink.feed(tail)
+            if killed:
+                return killed
+            size = os.fstat(outf.fileno()).st_size
+            start = max(0, size - MAX_RESULT_BYTES)  # bounded, even for runaway output
+            if start:
+                start = _skip_continuation(outf, start, size)
+            data = os.pread(outf.fileno(), size - start, start)
+            return p.returncode, data.decode("utf-8", "replace").strip()
     except FileNotFoundError as e:
         return 127, f"command not found: {e.filename or e}"
     except Exception as e:  # noqa: BLE001 - must never escape
         if p is not None and p.poll() is None:
             _kill_group(p)
         return 1, str(e)
-
-
-_ctx = threading.local()  # holds the shared deadline of the check running in this thread
 
 
 def _cmd(argv, **kw):
@@ -609,17 +769,21 @@ def gpu_verify(gc, since):
     expected = nvidia_gpu_count()
     deadline = _clock() + wait
     journal, found, active = "", [], True
+    emit(f"checking that {label} sees its GPUs (nvidia-smi lists {expected if expected is not None else 'unknown'})")
     while True:
-        rc, state = run_command(["systemctl", "is-active", unit], timeout=JOURNAL_TIMEOUT)
+        with _quiet():  # the same journal text every 2 seconds would only bury the real output
+            rc, state = run_command(["systemctl", "is-active", unit], timeout=JOURNAL_TIMEOUT)
         active = state.strip() == "active"
         if active:
-            rc, journal = run_command(["journalctl", "-u", unit, "--since", since, "--no-pager"],
-                                      timeout=JOURNAL_TIMEOUT)
+            with _quiet():
+                rc, journal = run_command(["journalctl", "-u", unit, "--since", since, "--no-pager"],
+                                          timeout=JOURNAL_TIMEOUT)
             why = journal_unreadable(rc, journal)
             if why:
                 return False, journal, why
             found = gpu_lines(journal)
             need = max(1, expected or 0)
+            emit(f"{label} reports {len(found)} GPU(s) so far")
             if len(found) >= need:
                 names = "\n".join(re.sub(r"^.*?(name=)", r"\1", ln) for ln in found)
                 return True, f"{label} sees {len(found)} GPU(s) (nvidia-smi lists {expected if expected is not None else 'unknown'}):\n{names}", \
@@ -685,23 +849,34 @@ def build_steps(b, meta):
     return add_gpu_check(steps, u)
 
 
-def run_steps(steps, progress=None):
+def run_steps(steps, progress=None, out=None):
     """Run steps in order, stop at the first failure. progress(index, state, note) is called
-    live with state running, ok or failed. Returns (ok, failed_name, reason, full_output)."""
+    live with state running, ok or failed. If `out` (an OutputBuffer) is given, each step's
+    output streams into it while it runs, after a "== name started ==" line. Returns
+    (ok, failed_name, reason, full_output)."""
     log = []
-    for i, step in enumerate(steps):
-        if progress:
-            progress(i, "running", "")
-        try:
-            ok, out, text = step.run()
-        except Exception as e:  # noqa: BLE001
-            ok, out, text = False, str(e), str(e)[:200] or type(e).__name__
-        log.append(f"--- {step.name} ({'ok' if ok else 'failed'}) ---\n{out}")
-        if progress:
-            progress(i, "ok" if ok else "failed", text)
-        if not ok:
-            return False, step.name, text, "\n".join(log)
-    return True, None, "", "\n".join(log)
+    old_sink = getattr(_ctx, "sink", None)
+    _ctx.sink = out
+    try:
+        for i, step in enumerate(steps):
+            if progress:
+                progress(i, "running", "")
+            if out is not None:
+                out.marker(f"== {step.name} started ==")
+            try:
+                ok, text_out, text = step.run()
+            except Exception as e:  # noqa: BLE001
+                ok, text_out, text = False, str(e), str(e)[:200] or type(e).__name__
+            log.append(f"--- {step.name} ({'ok' if ok else 'failed'}) ---\n{text_out}")
+            if out is not None:
+                out.marker(f"== {step.name} {'ok' if ok else 'failed'}: {text} ==" if text else f"== {step.name} {'ok' if ok else 'failed'} ==")
+            if progress:
+                progress(i, "ok" if ok else "failed", text)
+            if not ok:
+                return False, step.name, text, "\n".join(log)
+        return True, None, "", "\n".join(log)
+    finally:
+        _ctx.sink = old_sink
 
 
 def _apply_argv(b, u):
@@ -766,6 +941,7 @@ class Updater:
         self._cache = {}  # id -> status, detail, checked_at, meta, steps, incomplete
         self._checking = False
         self._applying = None  # id being updated
+        self._out = {}  # id -> OutputBuffer of the latest update (kept until the next one starts)
         self._epoch = 0  # bumped when an update finishes; older check results are dropped
         self._apply_lock = threading.Lock()
 
@@ -823,6 +999,8 @@ class Updater:
                               "checked_at": c["checked_at"], "running": running,
                               "can_apply": self._applicable(c) and applying != bid and reason is None,
                               "reason": reason, "applying": applying == bid, "steps": steps,
+                              "output_tail": self._out[bid].tail() if bid in self._out else "",
+                              "output_at": self._out[bid].finished_at if bid in self._out else None,
                               "progress": progress_text(steps) if steps else ""})
             return {"checking": checking, "applying": applying, "items": items}
 
@@ -935,6 +1113,7 @@ class Updater:
             if not self._apply_lock.acquire(blocking=False):
                 return 409, {"error": "Another update is running. Wait for it to finish."}
             self._applying = bid
+            self._out[bid] = OutputBuffer()
         if background:
             threading.Thread(target=self._apply_job, args=(bid, b), daemon=True).start()
         else:
@@ -965,7 +1144,8 @@ class Updater:
             with self._lock:
                 self._cache[bid] = {"status": CHECKING, "detail": progress_text(prog), "checked_at": time.time(),
                                     "meta": meta, "steps": prog, "incomplete": inc}
-            ok, name, reason, out = run_steps(steps, lambda i, st, note: self._set_progress(bid, prog, i, st, note))
+            ok, name, reason, out = run_steps(steps, lambda i, st, note: self._set_progress(bid, prog, i, st, note),
+                                              out=self._out.get(bid))
             if self._log:
                 try:
                     self._log(bid, f"=== update {time.ctime()} ({'ok' if ok else 'failed at ' + str(name)}) ===\n{out}\n")
@@ -993,6 +1173,8 @@ class Updater:
             self._store(bid, status, done + ("\n" + detail if detail else "") + "\n" + tail,
                         meta=meta2, steps=prog, incomplete=None)
         finally:
+            if bid in self._out:
+                self._out[bid].finish()
             with self._lock:
                 self._applying = None
                 self._epoch += 1
